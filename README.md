@@ -13,3 +13,10 @@ API limpia para Railway.
 - Reportes, arqueos y Google Sheets leen ventas canónicas para evitar inflación histórica.
 
 No incluye migraciones manuales ni archivos de prueba; el esquema faltante se crea de forma segura al iniciar.
+
+
+V61 BUILD FIX
+- Corrige CS8801 en SheetsReporter: una clase no puede invocar una función local top-level.
+- Mantiene la inicialización de protección contable en el arranque y endpoints de la API.
+- Actualiza Google.Apis.Sheets.v4 a 1.68.0.3658 para evitar la advertencia de versión aproximada en Railway.
+- Compatible con Caja/Admin V140.

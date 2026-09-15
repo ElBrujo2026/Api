@@ -9,7 +9,7 @@
 
   <ItemGroup>
     <PackageReference Include="MySqlConnector" Version="2.4.0" />
-    <PackageReference Include="Google.Apis.Sheets.v4" Version="1.68.0.3649" />
+    <PackageReference Include="Google.Apis.Sheets.v4" Version="1.68.0.3658" />
     <PackageReference Include="Google.Apis.Auth" Version="1.68.0" />
   </ItemGroup>
 

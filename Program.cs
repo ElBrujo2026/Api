@@ -64,7 +64,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
         return Results.Ok(new
         {
             ok = true,
-            version = "V60_PAGO_PRODUCTOS_MESA_ANTI_DUPLICADO",
+            version = "V61_BUILD_FIX_PAGO_PRODUCTOS_ANTI_DUPLICADO",
             database,
             mysql = "conectado",
             googleSheets = sheets.IsConfigured ? "configurado" : "faltan variables GOOGLE_SHEET_ID y GOOGLE_CREDENTIALS_JSON",
@@ -82,10 +82,10 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
 app.MapGet("/api/system/version", () => Results.Ok(new
 {
     ok = true,
-    apiVersion = "V60_PAGO_PRODUCTOS_MESA_ANTI_DUPLICADO",
+    apiVersion = "V61_BUILD_FIX_PAGO_PRODUCTOS_ANTI_DUPLICADO",
     minimumClientVersion = 140,
     accountingMode = "LIBRO_INMUTABLE_TRANSACCIONAL",
-    message = "Se requiere Caja/Admin V140 para pago parcial seguro de productos, contabilidad canónica, relevo y protección anti duplicado."
+    message = "Caja/Admin V140 compatible. V61 corrige el build de Railway manteniendo pago parcial seguro, contabilidad canónica, relevo y protección anti duplicado."
 }));
 
 app.MapGet("/api/sheets/status", (SheetsReporter sheets) =>
@@ -5129,7 +5129,10 @@ public sealed class SheetsReporter
         });
 
         await using var con = await db.OpenAsync();
-        await EnsureVentaSyncProtection(con);
+        // V61: el esquema de protección de ventas se garantiza al arrancar la API
+        // y en los endpoints contables. SheetsReporter es una clase y no puede invocar
+        // directamente una función local declarada en el top-level de Program.cs (CS8801).
+        // Aquí solo leemos las vistas/tablas ya inicializadas, evitando duplicar migraciones.
 
         foreach (int sucursalId in new[] { 1, 2 })
         {
