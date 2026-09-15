@@ -61,7 +61,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
         return Results.Ok(new
         {
             ok = true,
-            version = "V55_CAJAS_REALES_ANTI_DUPLICADO",
+            version = "V56_ARQUEO_EXCEL_CAJA_ANTI_DUPLICADO",
             database,
             mysql = "conectado",
             googleSheets = sheets.IsConfigured ? "configurado" : "faltan variables GOOGLE_SHEET_ID y GOOGLE_CREDENTIALS_JSON"
@@ -76,10 +76,10 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
 app.MapGet("/api/system/version", () => Results.Ok(new
 {
     ok = true,
-    apiVersion = "V55_CAJAS_REALES_ANTI_DUPLICADO",
+    apiVersion = "V56_ARQUEO_EXCEL_CAJA_ANTI_DUPLICADO",
     minimumClientVersion = 132,
     accountingMode = "LIBRO_INMUTABLE_TRANSACCIONAL",
-    message = "Se requiere Caja/Admin V132 para precios editables, promo automática del lunes y protección contable actual."
+    message = "Se requiere Caja/Admin V134 para arqueo conciliado, reporte por caja en Excel y protección contable actual."
 }));
 
 app.MapGet("/api/sheets/status", (SheetsReporter sheets) =>
@@ -1955,13 +1955,15 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
         bool ventaYaExistia = false;
 
         const string ventaSql = """
-            INSERT IGNORE INTO ventas (sucursal_id, cajero, fecha, tipo, metodo_pago, efectivo, qr, total, sync_key, operation_key, legacy_fingerprint, session_id)
-            VALUES (@sucursal_id, @cajero, @fecha, @tipo, @metodo_pago, @efectivo, @qr, @total, @sync_key, NULLIF(@operation_key,''), NULLIF(@legacy_fingerprint,''), @session_id);
+            INSERT IGNORE INTO ventas (sucursal_id, cajero, caja_nombre, turno, fecha, tipo, metodo_pago, efectivo, qr, total, sync_key, operation_key, legacy_fingerprint, session_id)
+            VALUES (@sucursal_id, @cajero, @caja_nombre, @turno, @fecha, @tipo, @metodo_pago, @efectivo, @qr, @total, @sync_key, NULLIF(@operation_key,''), NULLIF(@legacy_fingerprint,''), @session_id);
         """;
 
         await using var ventaCmd = new MySqlCommand(ventaSql, con, tx);
         ventaCmd.Parameters.AddWithValue("@sucursal_id", venta.SucursalId);
         ventaCmd.Parameters.AddWithValue("@cajero", venta.Cajero);
+        ventaCmd.Parameters.AddWithValue("@caja_nombre", string.IsNullOrWhiteSpace(venta.CajaNombre) ? (object)DBNull.Value : venta.CajaNombre.Trim());
+        ventaCmd.Parameters.AddWithValue("@turno", string.IsNullOrWhiteSpace(venta.Turno) ? HoraATurno(venta.Fecha) : NormalizarTurno(venta.Turno));
         ventaCmd.Parameters.AddWithValue("@fecha", venta.Fecha);
         ventaCmd.Parameters.AddWithValue("@tipo", venta.Tipo);
         ventaCmd.Parameters.AddWithValue("@metodo_pago", venta.MetodoPago);
@@ -2233,13 +2235,16 @@ app.MapGet("/api/ventas", async (Db db, int? sucursalId) =>
     try { await new MySqlCommand("ALTER TABLE ventas ADD COLUMN qr DECIMAL(10,2) NOT NULL DEFAULT 0;", con).ExecuteNonQueryAsync(); } catch { }
 
     const string sql = """
-        SELECT v.id, v.sucursal_id, CASE WHEN s.id = 2 THEN 'EL BRUJO PREMIU' ELSE 'EL BRUJO' END AS sucursal, v.cajero, v.fecha,
-               v.tipo, v.metodo_pago, COALESCE(v.efectivo,0) AS efectivo, COALESCE(v.qr,0) AS qr, v.total, v.sync_key, COALESCE(v.operation_key,'') AS operation_key, v.session_id
+        SELECT v.id, v.sucursal_id, CASE WHEN s.id = 2 THEN 'EL BRUJO PREMIU' ELSE 'EL BRUJO' END AS sucursal, v.cajero,
+               COALESCE(NULLIF(v.caja_nombre,''), NULLIF(u.caja_nombre,''), CASE WHEN v.sucursal_id=1 THEN 'CAJA ÚNICA' ELSE 'SIN CAJA' END) AS caja_nombre,
+               COALESCE(NULLIF(v.turno,''), NULLIF(u.turno,''), CASE WHEN TIME(v.fecha) >= '08:00:00' AND TIME(v.fecha) < '20:00:00' THEN 'MAÑANA' ELSE 'NOCHE' END) AS turno,
+               v.fecha, v.tipo, v.metodo_pago, COALESCE(v.efectivo,0) AS efectivo, COALESCE(v.qr,0) AS qr, v.total, v.sync_key, COALESCE(v.operation_key,'') AS operation_key, v.session_id
         FROM ventas v
         INNER JOIN sucursales s ON s.id = v.sucursal_id
+        LEFT JOIN usuarios u ON u.usuario=v.cajero AND u.sucursal_id=v.sucursal_id
         WHERE (@sucursalId IS NULL OR v.sucursal_id = @sucursalId)
         ORDER BY v.fecha DESC, v.id DESC
-        LIMIT 500;
+        LIMIT 10000;
     """;
 
     var rows = await db.QueryAsync(con, sql, new Dictionary<string, object?>
@@ -2700,6 +2705,53 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
         ? "CIERRE-" + r.SucursalId + "-" + (r.CajeroUsuario ?? "") + "-" + r.Inicio.Ticks
         : r.SyncKey.Trim();
 
+    // V56: el servidor vuelve a calcular el dinero del arqueo usando el libro canónico de VENTAS.
+    // Así un cierre local desactualizado no puede dejar Bs. 0 si Railway ya tiene ventas confirmadas.
+    int canonicalTransactions = Math.Max(0, r.TransaccionesTotal);
+    int canonicalCashTransactions = Math.Max(0, r.TransaccionesEfectivo);
+    int canonicalQrTransactions = Math.Max(0, r.TransaccionesQr);
+    decimal canonicalCash = Math.Max(0, r.Efectivo);
+    decimal canonicalQr = Math.Max(0, r.Qr);
+    decimal canonicalTotal = Math.Max(0, r.TotalGenerado);
+    bool reconciledFromSales = false;
+
+    try
+    {
+        await EnsureVentaSyncProtection(con);
+        await using var reconcile = new MySqlCommand("""
+            SELECT COUNT(*) AS operaciones,
+                   COALESCE(SUM(CASE WHEN efectivo > 0 THEN 1 ELSE 0 END),0) AS ops_efectivo,
+                   COALESCE(SUM(CASE WHEN qr > 0 THEN 1 ELSE 0 END),0) AS ops_qr,
+                   COALESCE(SUM(efectivo),0) AS efectivo,
+                   COALESCE(SUM(qr),0) AS qr,
+                   COALESCE(SUM(total),0) AS total
+            FROM ventas
+            WHERE sucursal_id = @sucursal_id
+              AND cajero = @cajero
+              AND fecha >= @inicio AND fecha < @fin;
+        """, con);
+        reconcile.Parameters.AddWithValue("@sucursal_id", r.SucursalId);
+        reconcile.Parameters.AddWithValue("@cajero", r.CajeroUsuario ?? "");
+        reconcile.Parameters.AddWithValue("@inicio", r.Inicio);
+        reconcile.Parameters.AddWithValue("@fin", r.Fin);
+        await using var rr = await reconcile.ExecuteReaderAsync();
+        if (await rr.ReadAsync())
+        {
+            int count = Convert.ToInt32(rr["operaciones"] ?? 0);
+            if (count > 0)
+            {
+                canonicalTransactions = count;
+                canonicalCashTransactions = Convert.ToInt32(rr["ops_efectivo"] ?? 0);
+                canonicalQrTransactions = Convert.ToInt32(rr["ops_qr"] ?? 0);
+                canonicalCash = Convert.ToDecimal(rr["efectivo"] ?? 0m);
+                canonicalQr = Convert.ToDecimal(rr["qr"] ?? 0m);
+                canonicalTotal = Convert.ToDecimal(rr["total"] ?? 0m);
+                reconciledFromSales = true;
+            }
+        }
+    }
+    catch { /* si aún no llegaron ventas al servidor, se conserva la fotografía enviada por la caja */ }
+
     const string sql = """
         INSERT INTO cierres_turno
         (
@@ -2738,13 +2790,13 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
         cmd.Parameters.AddWithValue("@fin", r.Fin);
         cmd.Parameters.AddWithValue("@hora_entrada", r.HoraEntrada == DateTime.MinValue ? r.Inicio : r.HoraEntrada);
         cmd.Parameters.AddWithValue("@fecha_cierre", r.FechaCierre);
-        cmd.Parameters.AddWithValue("@transacciones_total", Math.Max(0, r.TransaccionesTotal));
-        cmd.Parameters.AddWithValue("@transacciones_efectivo", Math.Max(0, r.TransaccionesEfectivo));
-        cmd.Parameters.AddWithValue("@transacciones_qr", Math.Max(0, r.TransaccionesQr));
+        cmd.Parameters.AddWithValue("@transacciones_total", canonicalTransactions);
+        cmd.Parameters.AddWithValue("@transacciones_efectivo", canonicalCashTransactions);
+        cmd.Parameters.AddWithValue("@transacciones_qr", canonicalQrTransactions);
         cmd.Parameters.AddWithValue("@transacciones_tarjeta", Math.Max(0, r.TransaccionesTarjeta));
         cmd.Parameters.AddWithValue("@transacciones_transferencia", Math.Max(0, r.TransaccionesTransferencia));
-        cmd.Parameters.AddWithValue("@efectivo", Math.Max(0, r.Efectivo));
-        cmd.Parameters.AddWithValue("@qr", Math.Max(0, r.Qr));
+        cmd.Parameters.AddWithValue("@efectivo", canonicalCash);
+        cmd.Parameters.AddWithValue("@qr", canonicalQr);
         cmd.Parameters.AddWithValue("@tarjeta", Math.Max(0, r.Tarjeta));
         cmd.Parameters.AddWithValue("@transferencia", Math.Max(0, r.Transferencia));
         cmd.Parameters.AddWithValue("@sin_metodo", Math.Max(0, r.SinMetodo));
@@ -2756,8 +2808,8 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
         cmd.Parameters.AddWithValue("@comisiones_total", Math.Max(0, r.ComisionesTotal));
         cmd.Parameters.AddWithValue("@gastos_total", Math.Max(0, r.GastosTotal));
         cmd.Parameters.AddWithValue("@perdidas_total", Math.Max(0, r.PerdidasTotal));
-        cmd.Parameters.AddWithValue("@total_generado", Math.Max(0, r.TotalGenerado));
-        cmd.Parameters.AddWithValue("@neto_turno", r.NetoTurno);
+        cmd.Parameters.AddWithValue("@total_generado", canonicalTotal);
+        cmd.Parameters.AddWithValue("@neto_turno", reconciledFromSales ? canonicalTotal - Math.Max(0, r.GastosTotal) : r.NetoTurno);
         cmd.Parameters.AddWithValue("@observaciones", r.Observaciones ?? "");
         cmd.Parameters.AddWithValue("@detalle_json", string.IsNullOrWhiteSpace(r.DetalleJson) ? "[]" : r.DetalleJson);
         cmd.Parameters.AddWithValue("@sync_key", syncKey);
@@ -2772,7 +2824,7 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
     }
 
     await TrySyncSheets(db, sheets);
-    return Results.Ok(new { ok = true, id, syncKey, message = "Arqueo guardado para Administración." });
+    return Results.Ok(new { ok = true, id, syncKey, reconciledFromSales, canonicalTransactions, canonicalCash, canonicalQr, canonicalTotal, message = reconciledFromSales ? "Arqueo guardado y conciliado contra ventas únicas de Railway." : "Arqueo guardado para Administración." });
 });
 
 app.MapGet("/api/admin/cierres-turno", async (Db db, string clave, int? sucursalId) =>
@@ -3778,6 +3830,8 @@ static async Task EnsureAccountingLedger(MySqlConnection con)
             venta_id BIGINT NOT NULL,
             sucursal_id INT NOT NULL,
             cajero VARCHAR(100) NOT NULL,
+            caja_nombre VARCHAR(60) NULL,
+            turno VARCHAR(20) NULL,
             fecha DATETIME NOT NULL,
             tipo VARCHAR(60) NOT NULL,
             metodo_pago VARCHAR(30) NOT NULL,
@@ -3863,6 +3917,31 @@ static async Task EnsureVentaSyncProtection(MySqlConnection con)
     // V48: relación explícita con sesión de mesa y clave de consumo cobrado.
     try { await new MySqlCommand("ALTER TABLE ventas ADD COLUMN session_id INT NULL AFTER legacy_fingerprint;", con).ExecuteNonQueryAsync(); } catch { }
     try { await new MySqlCommand("ALTER TABLE ventas ADD INDEX idx_ventas_session (sucursal_id, session_id, tipo);", con).ExecuteNonQueryAsync(); } catch { }
+    // V56: conservar caja y turno EXACTOS de la venta.
+    try { await new MySqlCommand("ALTER TABLE ventas ADD COLUMN caja_nombre VARCHAR(60) NULL AFTER cajero;", con).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE ventas ADD COLUMN turno VARCHAR(20) NULL AFTER caja_nombre;", con).ExecuteNonQueryAsync(); } catch { }
+
+    // V56: backfill histórico. El arqueo no depende de cómo esté configurado hoy el usuario:
+    // el turno se deriva de la hora REAL del cobro y la caja se toma del usuario cuando falta.
+    try
+    {
+        await new MySqlCommand("""
+            UPDATE ventas v
+            LEFT JOIN usuarios u ON u.usuario = v.cajero AND u.sucursal_id = v.sucursal_id
+            SET v.caja_nombre = CASE
+                    WHEN v.caja_nombre IS NOT NULL AND TRIM(v.caja_nombre) <> '' THEN v.caja_nombre
+                    WHEN v.sucursal_id = 1 THEN 'CAJA ÚNICA'
+                    ELSE NULLIF(TRIM(COALESCE(u.caja_nombre,'')), '')
+                END,
+                v.turno = CASE
+                    WHEN TIME(v.fecha) >= '08:00:00' AND TIME(v.fecha) < '20:00:00' THEN 'MAÑANA'
+                    ELSE 'NOCHE'
+                END
+            WHERE v.caja_nombre IS NULL OR TRIM(v.caja_nombre) = ''
+               OR v.turno IS NULL OR TRIM(v.turno) = '';
+        """, con).ExecuteNonQueryAsync();
+    }
+    catch { }
 
     // V44: huella de respaldo para cajas antiguas que no mandan operation_key.
     // NULL para ventas nuevas con OperationKey; hash SHA-256 para solicitudes legacy.
@@ -4194,6 +4273,9 @@ static string NormalizarTurno(string? turno)
     if (t.Contains("NOCHE")) return "NOCHE";
     return "MAÑANA";
 }
+
+static string HoraATurno(DateTime fecha)
+    => fecha.Hour >= 8 && fecha.Hour < 20 ? "MAÑANA" : "NOCHE";
 
 static string NormalizarCategoriaProducto(string? categoria, string? nombre)
 {
@@ -4900,10 +4982,10 @@ public sealed class SheetsReporter
                            WHEN TIME(v.fecha) >= '20:00:00' THEN DATE(v.fecha)
                            ELSE DATE(DATE_SUB(v.fecha, INTERVAL 1 DAY))
                        END AS fecha_turno,
-                       CASE
+                       COALESCE(NULLIF(v.turno,''), CASE
                            WHEN TIME(v.fecha) >= '08:00:00' AND TIME(v.fecha) < '20:00:00' THEN 'MAÑANA'
                            ELSE 'NOCHE'
-                       END AS turno,
+                       END) AS turno,
                        DATE(v.fecha) AS fecha, TIME(v.fecha) AS hora,
                        v.cajero, v.tipo, v.metodo_pago,
                        COALESCE(v.efectivo, 0) AS efectivo,
@@ -4911,9 +4993,9 @@ public sealed class SheetsReporter
                        v.total,
                        CASE
                            WHEN v.sucursal_id = 1 THEN 'CAJA ÚNICA'
-                           WHEN UPPER(COALESCE(u.caja_nombre, '')) IN ('CAJA 1','CAJA ARRIBA') THEN 'CAJA ARRIBA'
-                           WHEN UPPER(COALESCE(u.caja_nombre, '')) IN ('CAJA 2','CAJA ABAJO') THEN 'CAJA ABAJO'
-                           ELSE COALESCE(NULLIF(u.caja_nombre,''), 'SIN CAJA')
+                           WHEN UPPER(COALESCE(NULLIF(v.caja_nombre,''), u.caja_nombre, '')) IN ('CAJA 1','CAJA ARRIBA') THEN 'CAJA ARRIBA'
+                           WHEN UPPER(COALESCE(NULLIF(v.caja_nombre,''), u.caja_nombre, '')) IN ('CAJA 2','CAJA ABAJO') THEN 'CAJA ABAJO'
+                           ELSE COALESCE(NULLIF(v.caja_nombre,''), NULLIF(u.caja_nombre,''), 'SIN CAJA')
                        END AS caja
                 FROM ventas v
                 LEFT JOIN usuarios u ON u.usuario = v.cajero AND u.sucursal_id = v.sucursal_id
@@ -5051,23 +5133,36 @@ public sealed class SheetsReporter
             if (await TableExistsAsync(con, "cierres_turno"))
             {
                 cierres.AddRange((await db.QueryAsync(con, """
-                    SELECT DATE(fecha_cierre) AS fecha,
-                           turno,
-                           CASE WHEN COALESCE(cajero_nombre, '') <> '' THEN cajero_nombre ELSE cajero_usuario END AS cajero,
-                           transacciones_total,
-                           efectivo, qr,
-                           productos_total, mesas_total, propinas_total, comisiones_total,
-                           gastos_total, perdidas_total,
-                           total_generado, neto_turno, observaciones,
+                    SELECT DATE(c.fecha_cierre) AS fecha,
+                           c.turno,
+                           CASE WHEN COALESCE(c.cajero_nombre, '') <> '' THEN c.cajero_nombre ELSE c.cajero_usuario END AS cajero,
+                           CASE WHEN EXISTS (SELECT 1 FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                THEN (SELECT COUNT(*) FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                ELSE c.transacciones_total END AS transacciones_total,
+                           CASE WHEN EXISTS (SELECT 1 FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                THEN (SELECT COALESCE(SUM(vx.efectivo),0) FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                ELSE c.efectivo END AS efectivo,
+                           CASE WHEN EXISTS (SELECT 1 FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                THEN (SELECT COALESCE(SUM(vx.qr),0) FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                ELSE c.qr END AS qr,
+                           c.productos_total, c.mesas_total, c.propinas_total, c.comisiones_total,
+                           c.gastos_total, c.perdidas_total,
+                           CASE WHEN EXISTS (SELECT 1 FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                THEN (SELECT COALESCE(SUM(vx.total),0) FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                ELSE c.total_generado END AS total_generado,
+                           CASE WHEN EXISTS (SELECT 1 FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                THEN (SELECT COALESCE(SUM(vx.total),0) FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin) - c.gastos_total
+                                ELSE c.neto_turno END AS neto_turno,
+                           c.observaciones,
                            CASE
-                               WHEN sucursal_id = 1 THEN 'CAJA ÚNICA'
-                               WHEN UPPER(COALESCE(caja, '')) IN ('CAJA 1','CAJA ARRIBA') THEN 'CAJA ARRIBA'
-                               WHEN UPPER(COALESCE(caja, '')) IN ('CAJA 2','CAJA ABAJO') THEN 'CAJA ABAJO'
-                               ELSE COALESCE(NULLIF(caja,''), 'SIN CAJA')
+                               WHEN c.sucursal_id = 1 THEN 'CAJA ÚNICA'
+                               WHEN UPPER(COALESCE(c.caja, '')) IN ('CAJA 1','CAJA ARRIBA') THEN 'CAJA ARRIBA'
+                               WHEN UPPER(COALESCE(c.caja, '')) IN ('CAJA 2','CAJA ABAJO') THEN 'CAJA ABAJO'
+                               ELSE COALESCE(NULLIF(c.caja,''), 'SIN CAJA')
                            END AS caja_reporte
-                    FROM cierres_turno
-                    WHERE sucursal_id = @sucursal_id
-                    ORDER BY fecha_cierre DESC, id DESC;
+                    FROM cierres_turno c
+                    WHERE c.sucursal_id = @sucursal_id
+                    ORDER BY c.fecha_cierre DESC, c.id DESC;
                 """, args)).Select(r => new List<object>
                 {
                     DateOnlyText(r, "fecha"), Text(r, "turno"), Text(r, "cajero"), Val(r, "transacciones_total"),
@@ -5364,7 +5459,9 @@ public record VentaRequest(
     string? OperationKey,
     List<VentaDetalleRequest> Detalle,
     int? SessionId = null,
-    int? ClientVersion = null
+    int? ClientVersion = null,
+    string? CajaNombre = null,
+    string? Turno = null
 );
 
 public record CobroMesaRequest(
