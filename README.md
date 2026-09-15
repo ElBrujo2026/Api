@@ -1,37 +1,35 @@
-# BILLAR EL BRUJO API V54 - PRODUCCION LIMPIA
+# Billar El Brujo API V55 - Cajas reales + anti duplicado
 
-Este paquete contiene solo los archivos necesarios para GitHub/Railway.
-No incluye readmes antiguos, SQL de versiones anteriores, stock TXT ni archivos de prueba.
+API para Railway/MySQL/Google Sheets.
 
-## Version compatible
-- Caja/Admin requerida: V132 o superior.
-- Sucursal 1: EL BRUJO - 8 mesas (1..7 normales, 8 privada).
-- Sucursal 2: EL BRUJO PREMIU - 29 mesas.
+## Estructura operativa
 
-## Tarifas iniciales V54
-- Lunes: Bs 10/h (promocion activa).
-- Martes a domingo: Bs 20/h.
-- Mesa privada fuera de promo: Bs 20/h inicialmente.
-- El administrador puede editar precio normal, promo lunes y privada desde Caja/Admin V132.
-- La tarifa se congela al iniciar la sesion: cambiar precios no altera una mesa que ya esta jugando.
+### EL BRUJO (Sucursal 1)
+- 1 PC de caja.
+- 2 cajeros: MAÑANA y NOCHE.
+- Caja: `CAJA ÚNICA`.
+- 8 mesas: 7 normales + 1 privada.
 
-## Proteccion contra duplicados
-- Caja V132 obligatoria para registrar cobros.
-- SyncKey + OperationKey por venta.
-- Candado MySQL de servidor durante cobros simultaneos.
-- Un solo cierre final por SessionId.
-- ConsumptionKey para impedir cobrar dos veces un mismo consumo.
-- line_key y movement_key para no duplicar detalle ni descuento de inventario.
-- Libro de caja transaccional.
-- Los reportes de productos agrupan por producto/presentacion y no multiplican catalogos duplicados.
+### EL BRUJO PREMIU (Sucursal 2)
+- 2 PCs: `CAJA ARRIBA` y `CAJA ABAJO`.
+- 2 cajeros en MAÑANA y 2 cajeros en NOCHE.
+- 4 cajeros en total.
+- 29 mesas.
 
-## Railway
-Subir estos 5 archivos al repositorio de GitHub y conectar ese repositorio a Railway.
-Variables necesarias:
-- MYSQLHOST / MYSQLPORT / MYSQLDATABASE / MYSQLUSER / MYSQLPASSWORD (Railway MySQL)
-- GOOGLE_SHEET_ID
-- GOOGLE_CREDENTIALS_JSON
+Los usuarios de caja antiguos quedan INACTIVOS; su historial de ventas no se borra.
 
-Comprobacion despues del deploy:
-- /health -> version V54_PROMO_LUNES_ANTI_DUPLICADO
-- /api/system/version -> minimumClientVersion = 132
+## Variables Railway
+- `MYSQL_URL=${{MySQL.MYSQL_URL}}`
+- `GOOGLE_SHEET_ID`
+- `GOOGLE_CREDENTIALS_JSON`
+
+## Reportes Google Sheets
+Los reportes se escriben por sucursal. En V55 las hojas `*_VENTAS` y
+`*_CIERRES` incluyen la columna `caja` para distinguir CAJA ÚNICA,
+CAJA ARRIBA y CAJA ABAJO.
+
+## Integridad contable
+- Idempotencia por `sync_key` y `operation_key`.
+- Reintentos de red no deben crear otra venta.
+- Productos vendidos se agrupan por producto/presentacion en el reporte y no se usan para duplicar la recaudacion.
+- Ganancias de EL BRUJO y EL BRUJO PREMIU no se consolidan en las hojas operativas.

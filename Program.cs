@@ -61,7 +61,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
         return Results.Ok(new
         {
             ok = true,
-            version = "V54_PROMO_LUNES_ANTI_DUPLICADO",
+            version = "V55_CAJAS_REALES_ANTI_DUPLICADO",
             database,
             mysql = "conectado",
             googleSheets = sheets.IsConfigured ? "configurado" : "faltan variables GOOGLE_SHEET_ID y GOOGLE_CREDENTIALS_JSON"
@@ -76,7 +76,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
 app.MapGet("/api/system/version", () => Results.Ok(new
 {
     ok = true,
-    apiVersion = "V54_PROMO_LUNES_ANTI_DUPLICADO",
+    apiVersion = "V55_CAJAS_REALES_ANTI_DUPLICADO",
     minimumClientVersion = 132,
     accountingMode = "LIBRO_INMUTABLE_TRANSACCIONAL",
     message = "Se requiere Caja/Admin V132 para precios editables, promo automática del lunes y protección contable actual."
@@ -4132,17 +4132,37 @@ static async Task EnsureUserManagementTables(MySqlConnection con)
         SELECT 'admin', 'ElBrujo2026SI', 'ADMINISTRADOR', 1, 'ACTIVO', 'Administrador', 'ADMIN', 'MAÑANA'
         WHERE NOT EXISTS (SELECT 1 FROM usuarios WHERE usuario = 'admin');
 
+        -- EL BRUJO: 1 PC, 2 cajeros (uno por turno), misma CAJA ÚNICA.
         INSERT INTO usuarios (usuario, clave, rol, sucursal_id, estado, nombre_completo, caja_nombre, turno)
-        SELECT 'caja1', 'BrujoPremiu2026', 'CAJERO', 1, 'ACTIVO', 'Caja Sucursal 1', 'CAJA 1', 'MAÑANA'
-        WHERE NOT EXISTS (SELECT 1 FROM usuarios WHERE usuario = 'caja1');
+        SELECT 'brujo_manana', 'BrujoM2026', 'CAJERO', 1, 'ACTIVO', 'Cajero EL BRUJO Mañana', 'CAJA ÚNICA', 'MAÑANA'
+        WHERE NOT EXISTS (SELECT 1 FROM usuarios WHERE usuario = 'brujo_manana');
 
         INSERT INTO usuarios (usuario, clave, rol, sucursal_id, estado, nombre_completo, caja_nombre, turno)
-        SELECT 'caja2', 'BrujoPRO2026', 'CAJERO', 2, 'ACTIVO', 'Caja Sucursal 2', 'CAJA 1', 'MAÑANA'
-        WHERE NOT EXISTS (SELECT 1 FROM usuarios WHERE usuario = 'caja2');
+        SELECT 'brujo_noche', 'BrujoN2026', 'CAJERO', 1, 'ACTIVO', 'Cajero EL BRUJO Noche', 'CAJA ÚNICA', 'NOCHE'
+        WHERE NOT EXISTS (SELECT 1 FROM usuarios WHERE usuario = 'brujo_noche');
+
+        -- EL BRUJO PREMIU: 2 PCs (ARRIBA / ABAJO), 2 cajeros por turno = 4 cajeros.
+        INSERT INTO usuarios (usuario, clave, rol, sucursal_id, estado, nombre_completo, caja_nombre, turno)
+        SELECT 'premiu_arriba_manana', 'PremiuAM2026', 'CAJERO', 2, 'ACTIVO', 'Cajero PREMIU Arriba Mañana', 'CAJA ARRIBA', 'MAÑANA'
+        WHERE NOT EXISTS (SELECT 1 FROM usuarios WHERE usuario = 'premiu_arriba_manana');
 
         INSERT INTO usuarios (usuario, clave, rol, sucursal_id, estado, nombre_completo, caja_nombre, turno)
-        SELECT 'caja2_2', 'Caja2Sucursal2', 'CAJERO', 2, 'ACTIVO', 'Caja 2 Sucursal 2', 'CAJA 2', 'NOCHE'
-        WHERE NOT EXISTS (SELECT 1 FROM usuarios WHERE usuario = 'caja2_2');
+        SELECT 'premiu_abajo_manana', 'PremiuBM2026', 'CAJERO', 2, 'ACTIVO', 'Cajero PREMIU Abajo Mañana', 'CAJA ABAJO', 'MAÑANA'
+        WHERE NOT EXISTS (SELECT 1 FROM usuarios WHERE usuario = 'premiu_abajo_manana');
+
+        INSERT INTO usuarios (usuario, clave, rol, sucursal_id, estado, nombre_completo, caja_nombre, turno)
+        SELECT 'premiu_arriba_noche', 'PremiuAN2026', 'CAJERO', 2, 'ACTIVO', 'Cajero PREMIU Arriba Noche', 'CAJA ARRIBA', 'NOCHE'
+        WHERE NOT EXISTS (SELECT 1 FROM usuarios WHERE usuario = 'premiu_arriba_noche');
+
+        INSERT INTO usuarios (usuario, clave, rol, sucursal_id, estado, nombre_completo, caja_nombre, turno)
+        SELECT 'premiu_abajo_noche', 'PremiuBN2026', 'CAJERO', 2, 'ACTIVO', 'Cajero PREMIU Abajo Noche', 'CAJA ABAJO', 'NOCHE'
+        WHERE NOT EXISTS (SELECT 1 FROM usuarios WHERE usuario = 'premiu_abajo_noche');
+
+        -- Usuarios viejos de caja: se conservan para historial, pero no pueden volver a iniciar sesión.
+        UPDATE usuarios
+        SET estado = 'INACTIVO'
+        WHERE rol = 'CAJERO'
+          AND usuario IN ('caja1','caja1_noche','caja2','caja2_noche','caja2_2','caja2_2_noche');
 
         INSERT INTO usuarios (usuario, clave, rol, sucursal_id, estado, nombre_completo, caja_nombre, turno)
         SELECT 'ana_mesera', 'mesera123', 'MESERA', 1, 'ACTIVO', 'Ana Mesera', '', 'MAÑANA'
@@ -4871,7 +4891,7 @@ public sealed class SheetsReporter
             // ya impide que un reintento vuelva a crear el mismo cobro.
             List<List<object>> ventas = new()
             {
-                new() { "id_venta", "fecha_turno", "turno", "fecha", "hora", "cajero", "tipo", "metodo_pago", "efectivo", "qr", "total" }
+                new() { "id_venta", "fecha_turno", "turno", "fecha", "hora", "cajero", "tipo", "metodo_pago", "efectivo", "qr", "total", "caja" }
             };
             ventas.AddRange((await db.QueryAsync(con, """
                 SELECT v.id,
@@ -4888,14 +4908,21 @@ public sealed class SheetsReporter
                        v.cajero, v.tipo, v.metodo_pago,
                        COALESCE(v.efectivo, 0) AS efectivo,
                        COALESCE(v.qr, 0) AS qr,
-                       v.total
+                       v.total,
+                       CASE
+                           WHEN v.sucursal_id = 1 THEN 'CAJA ÚNICA'
+                           WHEN UPPER(COALESCE(u.caja_nombre, '')) IN ('CAJA 1','CAJA ARRIBA') THEN 'CAJA ARRIBA'
+                           WHEN UPPER(COALESCE(u.caja_nombre, '')) IN ('CAJA 2','CAJA ABAJO') THEN 'CAJA ABAJO'
+                           ELSE COALESCE(NULLIF(u.caja_nombre,''), 'SIN CAJA')
+                       END AS caja
                 FROM ventas v
+                LEFT JOIN usuarios u ON u.usuario = v.cajero AND u.sucursal_id = v.sucursal_id
                 WHERE v.sucursal_id = @sucursal_id
                 ORDER BY v.fecha DESC, v.id DESC;
             """, args)).Select(r => new List<object>
             {
                 Val(r, "id"), DateOnlyText(r, "fecha_turno"), Text(r, "turno"), DateOnlyText(r, "fecha"), Text(r, "hora"),
-                Text(r, "cajero"), Text(r, "tipo"), Text(r, "metodo_pago"), Val(r, "efectivo"), Val(r, "qr"), Val(r, "total")
+                Text(r, "cajero"), Text(r, "tipo"), Text(r, "metodo_pago"), Val(r, "efectivo"), Val(r, "qr"), Val(r, "total"), Text(r, "caja")
             }));
 
             // V53: PRODUCTOS es un resumen diario. El mismo producto/presentación aparece
@@ -5017,7 +5044,7 @@ public sealed class SheetsReporter
                 {
                     "fecha", "turno", "cajero", "transacciones",
                     "efectivo", "qr", "productos", "mesas", "propinas", "comisiones_meseras",
-                    "gastos", "perdidas", "total_generado", "neto_turno", "observaciones"
+                    "gastos", "perdidas", "total_generado", "neto_turno", "observaciones", "caja"
                 }
             };
 
@@ -5031,7 +5058,13 @@ public sealed class SheetsReporter
                            efectivo, qr,
                            productos_total, mesas_total, propinas_total, comisiones_total,
                            gastos_total, perdidas_total,
-                           total_generado, neto_turno, observaciones
+                           total_generado, neto_turno, observaciones,
+                           CASE
+                               WHEN sucursal_id = 1 THEN 'CAJA ÚNICA'
+                               WHEN UPPER(COALESCE(caja, '')) IN ('CAJA 1','CAJA ARRIBA') THEN 'CAJA ARRIBA'
+                               WHEN UPPER(COALESCE(caja, '')) IN ('CAJA 2','CAJA ABAJO') THEN 'CAJA ABAJO'
+                               ELSE COALESCE(NULLIF(caja,''), 'SIN CAJA')
+                           END AS caja_reporte
                     FROM cierres_turno
                     WHERE sucursal_id = @sucursal_id
                     ORDER BY fecha_cierre DESC, id DESC;
@@ -5040,7 +5073,7 @@ public sealed class SheetsReporter
                     DateOnlyText(r, "fecha"), Text(r, "turno"), Text(r, "cajero"), Val(r, "transacciones_total"),
                     Val(r, "efectivo"), Val(r, "qr"), Val(r, "productos_total"), Val(r, "mesas_total"),
                     Val(r, "propinas_total"), Val(r, "comisiones_total"), Val(r, "gastos_total"), Val(r, "perdidas_total"),
-                    Val(r, "total_generado"), Val(r, "neto_turno"), Text(r, "observaciones")
+                    Val(r, "total_generado"), Val(r, "neto_turno"), Text(r, "observaciones"), Text(r, "caja_reporte")
                 }));
             }
 
