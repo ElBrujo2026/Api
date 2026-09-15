@@ -55,16 +55,22 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
     try
     {
         await using var con = await db.OpenAsync();
+        await EnsureVentaSyncProtection(con);
         await using var cmd = new MySqlCommand("SELECT DATABASE();", con);
         var database = Convert.ToString(await cmd.ExecuteScalarAsync());
+        long ventasRaw = Convert.ToInt64(await new MySqlCommand("SELECT COUNT(*) FROM ventas;", con).ExecuteScalarAsync() ?? 0L);
+        long ventasCanonicas = Convert.ToInt64(await new MySqlCommand("SELECT COUNT(*) FROM ventas_canonicas;", con).ExecuteScalarAsync() ?? 0L);
 
         return Results.Ok(new
         {
             ok = true,
-            version = "V57_RELEVO_TRANSFERENCIA_ANTI_DUPLICADO",
+            version = "V60_PAGO_PRODUCTOS_MESA_ANTI_DUPLICADO",
             database,
             mysql = "conectado",
-            googleSheets = sheets.IsConfigured ? "configurado" : "faltan variables GOOGLE_SHEET_ID y GOOGLE_CREDENTIALS_JSON"
+            googleSheets = sheets.IsConfigured ? "configurado" : "faltan variables GOOGLE_SHEET_ID y GOOGLE_CREDENTIALS_JSON",
+            ventasRaw,
+            ventasCanonicas,
+            duplicadosHistoricosIgnorados = Math.Max(0, ventasRaw - ventasCanonicas)
         });
     }
     catch (Exception ex)
@@ -76,10 +82,10 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
 app.MapGet("/api/system/version", () => Results.Ok(new
 {
     ok = true,
-    apiVersion = "V57_RELEVO_TRANSFERENCIA_ANTI_DUPLICADO",
-    minimumClientVersion = 137,
+    apiVersion = "V60_PAGO_PRODUCTOS_MESA_ANTI_DUPLICADO",
+    minimumClientVersion = 140,
     accountingMode = "LIBRO_INMUTABLE_TRANSACCIONAL",
-    message = "Se requiere Caja/Admin V137 para relevo seguro, transferencia, arqueo conciliado y protección anti duplicado."
+    message = "Se requiere Caja/Admin V140 para pago parcial seguro de productos, contabilidad canónica, relevo y protección anti duplicado."
 }));
 
 app.MapGet("/api/sheets/status", (SheetsReporter sheets) =>
@@ -1749,8 +1755,8 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
     {
         // V45: bloqueo de cajas antiguas. Evita que una versión sin OperationKey/cola offline
         // vuelva a inflar ventas o stock.
-        if (!venta.ClientVersion.HasValue || venta.ClientVersion.Value < 132)
-            return Results.Json(new { ok = false, message = "Caja desactualizada. Se requiere V132 o superior para registrar cobros en Railway.", minimumClientVersion = 137 }, statusCode: StatusCodes.Status426UpgradeRequired);
+        if (!venta.ClientVersion.HasValue || venta.ClientVersion.Value < 140)
+            return Results.Json(new { ok = false, message = "Caja desactualizada. Se requiere Caja V140 o superior para registrar cobros en Railway.", minimumClientVersion = 140 }, statusCode: StatusCodes.Status426UpgradeRequired);
 
         string syncKey = string.IsNullOrWhiteSpace(venta.SyncKey)
             ? Guid.NewGuid().ToString("N")
@@ -1762,7 +1768,7 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
         // V47: toda Caja V128+ debe traer las dos identidades. Si falta una, NO se inventa
         // una nueva en el servidor, porque eso podría transformar un reintento en otra venta.
         if (string.IsNullOrWhiteSpace(venta.SyncKey) || string.IsNullOrWhiteSpace(operationKey))
-            return Results.BadRequest(new { ok = false, message = "El cobro llegó sin SyncKey u OperationKey. Se bloqueó para evitar duplicación.", minimumClientVersion = 137 });
+            return Results.BadRequest(new { ok = false, message = "El cobro llegó sin SyncKey u OperationKey. Se bloqueó para evitar duplicación.", minimumClientVersion = 140 });
 
         // V54: candados de servidor. Serializan reintentos simultáneos aunque una base histórica
         // todavía no haya podido crear todos los índices UNIQUE por duplicados antiguos.
@@ -1911,6 +1917,19 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
             return Results.BadRequest(new { ok = false, message = "El total cobrado no cuadra con los productos. Se bloqueó para evitar desviaciones.", detalle = detalleTotal, esperado = detalleRedondeado, recibido = totalSeguro });
         if (tipoSeguro == "MESA" && detalleTotal - totalSeguro > 0.01m)
             return Results.BadRequest(new { ok = false, message = "Los productos superan el total cobrado de la mesa. Se bloqueó para evitar un descuadre.", detalle = detalleTotal, total = totalSeguro });
+
+        // V60: TODO pago parcial de productos debe identificar cada línea con ConsumptionKey.
+        // Una misma key no puede repetirse dentro del request ni existir en otra venta.
+        if (tipoSeguro == "CONSUMO_MESA")
+        {
+            List<string> partialKeys = venta.Detalle
+                .Select(d => (d.ConsumptionKey ?? "").Trim())
+                .ToList();
+            if (partialKeys.Any(string.IsNullOrWhiteSpace))
+                return Results.BadRequest(new { ok = false, message = "Un pago parcial llegó con productos sin ConsumptionKey. Se bloqueó para evitar doble cobro.", minimumClientVersion = 140 });
+            if (partialKeys.Distinct(StringComparer.OrdinalIgnoreCase).Count() != partialKeys.Count)
+                return Results.BadRequest(new { ok = false, message = "El mismo producto aparece repetido dentro del pago parcial. Se bloqueó para evitar inflación.", minimumClientVersion = 140 });
+        }
 
         // V48: un cierre final de sesión se contabiliza una sola vez, aunque llegue con otra OperationKey.
         if (tipoSeguro == "MESA" && venta.SessionId.HasValue)
@@ -2240,7 +2259,7 @@ app.MapGet("/api/ventas", async (Db db, int? sucursalId) =>
                COALESCE(NULLIF(v.caja_nombre,''), NULLIF(u.caja_nombre,''), CASE WHEN v.sucursal_id=1 THEN 'CAJA ÚNICA' ELSE 'SIN CAJA' END) AS caja_nombre,
                COALESCE(NULLIF(v.turno,''), NULLIF(u.turno,''), CASE WHEN TIME(v.fecha) >= '08:00:00' AND TIME(v.fecha) < '20:00:00' THEN 'MAÑANA' ELSE 'NOCHE' END) AS turno,
                v.fecha, v.tipo, v.metodo_pago, COALESCE(v.efectivo,0) AS efectivo, COALESCE(v.qr,0) AS qr, v.total, v.sync_key, COALESCE(v.operation_key,'') AS operation_key, v.session_id
-        FROM ventas v
+        FROM ventas_canonicas v
         INNER JOIN sucursales s ON s.id = v.sucursal_id
         LEFT JOIN usuarios u ON u.usuario=v.cajero AND u.sucursal_id=v.sucursal_id
         WHERE (@sucursalId IS NULL OR v.sucursal_id = @sucursalId)
@@ -2261,6 +2280,7 @@ app.MapGet("/api/ventas", async (Db db, int? sucursalId) =>
 app.MapGet("/api/detalle-ventas", async (Db db, int? sucursalId) =>
 {
     await using var con = await db.OpenAsync();
+    await EnsureVentaSyncProtection(con);
 
     string where = sucursalId.HasValue ? "WHERE v.sucursal_id = @sucursal_id" : "";
 
@@ -2274,8 +2294,8 @@ app.MapGet("/api/detalle-ventas", async (Db db, int? sucursalId) =>
                d.precio_unitario AS precio,
                d.subtotal,
                COALESCE(d.consumption_key,'') AS consumption_key
-        FROM detalle_ventas d
-        INNER JOIN ventas v ON v.id = d.venta_id
+        FROM detalle_ventas_canonico d
+        INNER JOIN ventas_canonicas v ON v.id = d.venta_id
         INNER JOIN sucursales s ON s.id = v.sucursal_id
         {where}
         ORDER BY d.venta_id DESC, d.id DESC;
@@ -2294,13 +2314,15 @@ app.MapGet("/api/admin/conciliacion", async (Db db, string? clave, int? sucursal
     await using var con = await db.OpenAsync();
     await EnsureAccountingLedger(con);
 
+    await EnsureVentaSyncProtection(con);
     const string sql = """
         SELECT
-            COALESCE((SELECT SUM(total) FROM ventas WHERE (@sucursalId IS NULL OR sucursal_id=@sucursalId)),0) AS ventas_total,
-            COALESCE((SELECT SUM(total) FROM libro_caja WHERE estado='CONFIRMADA' AND (@sucursalId IS NULL OR sucursal_id=@sucursalId)),0) AS libro_total,
-            COALESCE((SELECT SUM(efectivo+qr+CASE WHEN UPPER(metodo_pago)='TRANSFERENCIA' THEN total ELSE 0 END) FROM libro_caja WHERE estado='CONFIRMADA' AND (@sucursalId IS NULL OR sucursal_id=@sucursalId)),0) AS medios_total,
-            COALESCE((SELECT COUNT(*) FROM ventas WHERE (@sucursalId IS NULL OR sucursal_id=@sucursalId)),0) AS ventas_count,
-            COALESCE((SELECT COUNT(*) FROM libro_caja WHERE estado='CONFIRMADA' AND (@sucursalId IS NULL OR sucursal_id=@sucursalId)),0) AS libro_count;
+            COALESCE((SELECT SUM(total) FROM ventas_canonicas WHERE (@sucursalId IS NULL OR sucursal_id=@sucursalId)),0) AS ventas_total,
+            COALESCE((SELECT SUM(l.total) FROM libro_caja l INNER JOIN ventas_canonicas v ON v.id=l.venta_id WHERE l.estado='CONFIRMADA' AND (@sucursalId IS NULL OR l.sucursal_id=@sucursalId)),0) AS libro_total,
+            COALESCE((SELECT SUM(l.efectivo+l.qr+CASE WHEN UPPER(l.metodo_pago)='TRANSFERENCIA' THEN l.total ELSE 0 END) FROM libro_caja l INNER JOIN ventas_canonicas v ON v.id=l.venta_id WHERE l.estado='CONFIRMADA' AND (@sucursalId IS NULL OR l.sucursal_id=@sucursalId)),0) AS medios_total,
+            COALESCE((SELECT COUNT(*) FROM ventas_canonicas WHERE (@sucursalId IS NULL OR sucursal_id=@sucursalId)),0) AS ventas_count,
+            COALESCE((SELECT COUNT(*) FROM libro_caja l INNER JOIN ventas_canonicas v ON v.id=l.venta_id WHERE l.estado='CONFIRMADA' AND (@sucursalId IS NULL OR l.sucursal_id=@sucursalId)),0) AS libro_count,
+            COALESCE((SELECT COUNT(*) FROM ventas WHERE (@sucursalId IS NULL OR sucursal_id=@sucursalId)),0) AS ventas_raw_count;
     """;
     await using var cmd = new MySqlCommand(sql, con);
     cmd.Parameters.AddWithValue("@sucursalId", sucursalId.HasValue ? sucursalId.Value : DBNull.Value);
@@ -2311,8 +2333,10 @@ app.MapGet("/api/admin/conciliacion", async (Db db, string? clave, int? sucursal
     decimal mediosTotal = rd.GetDecimal(2);
     long ventasCount = rd.GetInt64(3);
     long libroCount = rd.GetInt64(4);
+    long ventasRawCount = rd.GetInt64(5);
+    long duplicadosHistoricosIgnorados = Math.Max(0, ventasRawCount - ventasCount);
     bool cuadra = Math.Abs(ventasTotal-libroTotal) < 0.01m && Math.Abs(libroTotal-mediosTotal) < 0.01m && ventasCount == libroCount;
-    return Results.Ok(new { ok=true, cuadra, ventasTotal, libroTotal, mediosTotal, ventasCount, libroCount, diferenciaVentasLibro = ventasTotal-libroTotal, diferenciaLibroMedios = libroTotal-mediosTotal });
+    return Results.Ok(new { ok=true, cuadra, ventasTotal, libroTotal, mediosTotal, ventasCount, libroCount, ventasRawCount, duplicadosHistoricosIgnorados, diferenciaVentasLibro = ventasTotal-libroTotal, diferenciaLibroMedios = libroTotal-mediosTotal });
 });
 
 app.MapPost("/api/cobros-mesa", async (Db db, SheetsReporter sheets, CobroMesaRequest c) =>
@@ -2715,6 +2739,8 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
     decimal canonicalCash = Math.Max(0, r.Efectivo);
     decimal canonicalQr = Math.Max(0, r.Qr);
     decimal canonicalTransfer = Math.Max(0, r.Transferencia);
+    decimal canonicalProduct = Math.Max(0, r.ProductosTotal);
+    decimal canonicalTable = Math.Max(0, r.MesasTotal);
     decimal canonicalTotal = Math.Max(0, r.TotalGenerado);
     bool reconciledFromSales = false;
 
@@ -2728,15 +2754,31 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
                    COALESCE(SUM(CASE WHEN UPPER(metodo_pago)='TRANSFERENCIA' THEN 1 ELSE 0 END),0) AS ops_transferencia,
                    COALESCE(SUM(efectivo),0) AS efectivo,
                    COALESCE(SUM(qr),0) AS qr,
-                   COALESCE(SUM(CASE WHEN UPPER(metodo_pago)='TRANSFERENCIA' THEN total ELSE 0 END),0) AS transferencia,
-                   COALESCE(SUM(total),0) AS total
-            FROM ventas
-            WHERE sucursal_id = @sucursal_id
-              AND cajero = @cajero
-              AND fecha >= @inicio AND fecha < @fin;
+                   COALESCE(SUM(CASE WHEN UPPER(v.metodo_pago)='TRANSFERENCIA' THEN v.total ELSE 0 END),0) AS transferencia,
+                   COALESCE(SUM(CASE
+                       WHEN UPPER(v.tipo) IN ('DIRECTA','CONSUMO_MESA') THEN v.total
+                       WHEN UPPER(v.tipo)='MESA' THEN LEAST(v.total, COALESCE(dt.detalle_total,0))
+                       ELSE 0 END),0) AS productos_total,
+                   COALESCE(SUM(CASE
+                       WHEN UPPER(v.tipo)='MESA' THEN GREATEST(v.total - LEAST(v.total, COALESCE(dt.detalle_total,0)),0)
+                       ELSE 0 END),0) AS mesas_total,
+                   COALESCE(SUM(v.total),0) AS total
+            FROM ventas_canonicas v
+            LEFT JOIN (
+                SELECT venta_id, SUM(subtotal) AS detalle_total
+                FROM detalle_ventas_canonico
+                GROUP BY venta_id
+            ) dt ON dt.venta_id = v.id
+            WHERE v.sucursal_id = @sucursal_id
+              AND v.cajero = @cajero
+              AND UPPER(COALESCE(NULLIF(v.turno,''), CASE
+                    WHEN TIME(v.fecha) >= '08:00:00' AND TIME(v.fecha) < '20:00:00' THEN 'MAÑANA'
+                    ELSE 'NOCHE' END)) = @turno
+              AND v.fecha >= @inicio AND v.fecha < @fin;
         """, con);
         reconcile.Parameters.AddWithValue("@sucursal_id", r.SucursalId);
         reconcile.Parameters.AddWithValue("@cajero", r.CajeroUsuario ?? "");
+        reconcile.Parameters.AddWithValue("@turno", NormalizarTurno(r.Turno));
         reconcile.Parameters.AddWithValue("@inicio", r.Inicio);
         reconcile.Parameters.AddWithValue("@fin", r.Fin);
         await using var rr = await reconcile.ExecuteReaderAsync();
@@ -2752,6 +2794,8 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
                 canonicalCash = Convert.ToDecimal(rr["efectivo"] ?? 0m);
                 canonicalQr = Convert.ToDecimal(rr["qr"] ?? 0m);
                 canonicalTransfer = Convert.ToDecimal(rr["transferencia"] ?? 0m);
+                canonicalProduct = Convert.ToDecimal(rr["productos_total"] ?? 0m);
+                canonicalTable = Convert.ToDecimal(rr["mesas_total"] ?? 0m);
                 canonicalTotal = Convert.ToDecimal(rr["total"] ?? 0m);
                 reconciledFromSales = true;
             }
@@ -2831,8 +2875,8 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
         cmd.Parameters.AddWithValue("@tarjeta", Math.Max(0, r.Tarjeta));
         cmd.Parameters.AddWithValue("@transferencia", reconciledFromSales ? canonicalTransfer : Math.Max(0, r.Transferencia));
         cmd.Parameters.AddWithValue("@sin_metodo", Math.Max(0, r.SinMetodo));
-        cmd.Parameters.AddWithValue("@productos_total", Math.Max(0, r.ProductosTotal));
-        cmd.Parameters.AddWithValue("@mesas_total", Math.Max(0, r.MesasTotal));
+        cmd.Parameters.AddWithValue("@productos_total", reconciledFromSales ? canonicalProduct : Math.Max(0, r.ProductosTotal));
+        cmd.Parameters.AddWithValue("@mesas_total", reconciledFromSales ? canonicalTable : Math.Max(0, r.MesasTotal));
         cmd.Parameters.AddWithValue("@minutos_jugados", Math.Max(0, r.MinutosJugados));
         cmd.Parameters.AddWithValue("@propinas_total", Math.Max(0, r.PropinasTotal));
         cmd.Parameters.AddWithValue("@cortesias_valor", Math.Max(0, r.CortesiasValor));
@@ -2930,6 +2974,7 @@ app.MapGet("/api/admin/cierres-turno", async (Db db, string clave, int? sucursal
 app.MapGet("/api/reportes/resumen", async (Db db) =>
 {
     await using var con = await db.OpenAsync();
+    await EnsureVentaSyncProtection(con);
 
     const string sql = """
         SELECT
@@ -2937,7 +2982,7 @@ app.MapGet("/api/reportes/resumen", async (Db db) =>
             COALESCE(SUM(v.total), 0) AS total_ventas,
             COUNT(v.id) AS cantidad_ventas
         FROM sucursales s
-        LEFT JOIN ventas v ON v.sucursal_id = s.id
+        LEFT JOIN ventas_canonicas v ON v.sucursal_id = s.id
         GROUP BY s.id, s.nombre
         ORDER BY s.id;
     """;
@@ -2948,7 +2993,7 @@ app.MapGet("/api/reportes/resumen", async (Db db) =>
         SELECT
             COALESCE(SUM(total), 0) AS total_general,
             COUNT(id) AS cantidad_ventas
-        FROM ventas;
+        FROM ventas_canonicas;
     """;
 
     var total = await db.QueryAsync(con, totalSql);
@@ -3945,6 +3990,9 @@ static async Task EnsureVentaSyncProtection(MySqlConnection con)
     // no el intento de sincronización. Dos PCs no pueden confirmar la misma operación.
     try { await new MySqlCommand("ALTER TABLE ventas ADD COLUMN operation_key VARCHAR(220) NULL AFTER sync_key;", con).ExecuteNonQueryAsync(); } catch { }
     try { await new MySqlCommand("ALTER TABLE ventas ADD UNIQUE KEY uk_ventas_operation_key (operation_key);", con).ExecuteNonQueryAsync(); } catch { }
+    // V59: legacy_fingerprint debe existir ANTES de agregar session_id. En bases antiguas el orden
+    // anterior podía dejar session_id sin crear si legacy_fingerprint todavía no existía.
+    try { await new MySqlCommand("ALTER TABLE ventas ADD COLUMN legacy_fingerprint VARCHAR(64) NULL AFTER operation_key;", con).ExecuteNonQueryAsync(); } catch { }
     // V48: relación explícita con sesión de mesa y clave de consumo cobrado.
     try { await new MySqlCommand("ALTER TABLE ventas ADD COLUMN session_id INT NULL AFTER legacy_fingerprint;", con).ExecuteNonQueryAsync(); } catch { }
     try { await new MySqlCommand("ALTER TABLE ventas ADD INDEX idx_ventas_session (sucursal_id, session_id, tipo);", con).ExecuteNonQueryAsync(); } catch { }
@@ -4005,6 +4053,93 @@ static async Task EnsureVentaSyncProtection(MySqlConnection con)
     }
     catch { }
     try { await new MySqlCommand("ALTER TABLE ventas ADD UNIQUE KEY uk_ventas_legacy_fingerprint (legacy_fingerprint);", con).ExecuteNonQueryAsync(); } catch { }
+
+    // V59: vistas contables canónicas. NO borran ventas ni detalles históricos; garantizan que
+    // arqueos, reportes, Excel/Sheets y descargas lean una sola copia por operación/línea.
+    try
+    {
+        await new MySqlCommand("""
+            CREATE OR REPLACE VIEW detalle_ventas_canonico AS
+            SELECT id, venta_id, producto_id, presentacion_id, producto, presentacion,
+                   cantidad, precio_unitario, subtotal, line_key, consumption_key
+            FROM (
+                SELECT d.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY CASE
+                               WHEN d.consumption_key IS NOT NULL AND TRIM(d.consumption_key) <> ''
+                                   THEN CONCAT('CONS|', UPPER(TRIM(d.consumption_key)))
+                               WHEN d.line_key IS NOT NULL AND TRIM(d.line_key) <> ''
+                                   THEN CONCAT('LINE|', LOWER(TRIM(d.line_key)))
+                               ELSE CONCAT(
+                                   'ECON|', d.venta_id, '|', UPPER(TRIM(COALESCE(d.producto,''))), '|',
+                                   UPPER(TRIM(COALESCE(d.presentacion,''))), '|',
+                                   CAST(ROUND(COALESCE(d.cantidad,0),4) AS CHAR), '|',
+                                   CAST(ROUND(COALESCE(d.precio_unitario,0),2) AS CHAR), '|',
+                                   CAST(ROUND(COALESCE(d.subtotal,0),2) AS CHAR)
+                               )
+                           END
+                           ORDER BY d.id
+                       ) AS rn
+                FROM detalle_ventas d
+            ) ranked
+            WHERE rn = 1;
+        """, con).ExecuteNonQueryAsync();
+
+        await new MySqlCommand("""
+            CREATE OR REPLACE VIEW ventas_canonicas AS
+            SELECT id, sucursal_id, cajero, caja_nombre, turno, fecha, tipo, metodo_pago,
+                   efectivo, qr, total, sync_key, operation_key, legacy_fingerprint, session_id
+            FROM (
+                SELECT v.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY CASE
+                               WHEN v.operation_key IS NOT NULL AND TRIM(v.operation_key) <> ''
+                                   THEN CONCAT('OP|', UPPER(TRIM(v.operation_key)))
+                               WHEN v.legacy_fingerprint IS NOT NULL AND TRIM(v.legacy_fingerprint) <> ''
+                                   THEN CONCAT('FP|', LOWER(TRIM(v.legacy_fingerprint)))
+                               WHEN UPPER(TRIM(COALESCE(v.tipo,''))) = 'MESA' AND COALESCE(v.session_id,0) > 0
+                                   THEN CONCAT('MESA|', v.sucursal_id, '|', v.session_id)
+                               ELSE CONCAT(
+                                   'ECON|', v.sucursal_id, '|', UPPER(TRIM(COALESCE(v.cajero,''))), '|',
+                                   UPPER(TRIM(COALESCE(v.tipo,''))), '|', UPPER(TRIM(COALESCE(v.metodo_pago,''))), '|',
+                                   DATE_FORMAT(v.fecha, '%Y%m%d%H%i%s'), '|',
+                                   CAST(ROUND(COALESCE(v.efectivo,0),2) AS CHAR), '|',
+                                   CAST(ROUND(COALESCE(v.qr,0),2) AS CHAR), '|',
+                                   CAST(ROUND(COALESCE(v.total,0),2) AS CHAR), '|',
+                                   COALESCE(df.detalle_fingerprint,'SINDETALLE')
+                               )
+                           END
+                           ORDER BY v.id
+                       ) AS rn
+                FROM ventas v
+                LEFT JOIN (
+                    SELECT dc.venta_id,
+                           SHA2(GROUP_CONCAT(
+                               CONCAT(
+                                   UPPER(TRIM(COALESCE(dc.producto,''))), '~',
+                                   UPPER(TRIM(COALESCE(dc.presentacion,''))), '~',
+                                   CAST(ROUND(COALESCE(dc.cantidad,0),4) AS CHAR), '~',
+                                   CAST(ROUND(COALESCE(dc.subtotal,0),2) AS CHAR)
+                               )
+                               ORDER BY UPPER(TRIM(COALESCE(dc.producto,''))),
+                                        UPPER(TRIM(COALESCE(dc.presentacion,''))),
+                                        dc.cantidad, dc.subtotal
+                               SEPARATOR ';'
+                           ), 256) AS detalle_fingerprint
+                    FROM detalle_ventas_canonico dc
+                    GROUP BY dc.venta_id
+                ) df ON df.venta_id = v.id
+                WHERE v.total > 0
+            ) ranked
+            WHERE rn = 1;
+        """, con).ExecuteNonQueryAsync();
+    }
+    catch
+    {
+        // Si MySQL todavía está aplicando una migración, los endpoints de escritura siguen operativos.
+        // El siguiente arranque reintentará crear las vistas sin borrar datos.
+    }
+
 }
 
 static string FingerprintNormalize(string? value)
@@ -4994,6 +5129,7 @@ public sealed class SheetsReporter
         });
 
         await using var con = await db.OpenAsync();
+        await EnsureVentaSyncProtection(con);
 
         foreach (int sucursalId in new[] { 1, 2 })
         {
@@ -5009,9 +5145,10 @@ public sealed class SheetsReporter
             ventas.AddRange((await db.QueryAsync(con, """
                 SELECT v.id,
                        CASE
-                           WHEN TIME(v.fecha) >= '08:00:00' AND TIME(v.fecha) < '20:00:00' THEN DATE(v.fecha)
-                           WHEN TIME(v.fecha) >= '20:00:00' THEN DATE(v.fecha)
-                           ELSE DATE(DATE_SUB(v.fecha, INTERVAL 1 DAY))
+                           WHEN UPPER(COALESCE(NULLIF(v.turno,''), CASE WHEN TIME(v.fecha) >= '08:00:00' AND TIME(v.fecha) < '20:00:00' THEN 'MAÑANA' ELSE 'NOCHE' END)) = 'NOCHE'
+                                AND TIME(v.fecha) < '20:00:00'
+                               THEN DATE(DATE_SUB(v.fecha, INTERVAL 1 DAY))
+                           ELSE DATE(v.fecha)
                        END AS fecha_turno,
                        COALESCE(NULLIF(v.turno,''), CASE
                            WHEN TIME(v.fecha) >= '08:00:00' AND TIME(v.fecha) < '20:00:00' THEN 'MAÑANA'
@@ -5029,7 +5166,7 @@ public sealed class SheetsReporter
                            WHEN UPPER(COALESCE(NULLIF(v.caja_nombre,''), u.caja_nombre, '')) IN ('CAJA 2','CAJA ABAJO') THEN 'CAJA ABAJO'
                            ELSE COALESCE(NULLIF(v.caja_nombre,''), NULLIF(u.caja_nombre,''), 'SIN CAJA')
                        END AS caja
-                FROM ventas v
+                FROM ventas_canonicas v
                 LEFT JOIN usuarios u ON u.usuario = v.cajero AND u.sucursal_id = v.sucursal_id
                 WHERE v.sucursal_id = @sucursal_id
                 ORDER BY v.fecha DESC, v.id DESC;
@@ -5051,21 +5188,22 @@ public sealed class SheetsReporter
             productos.AddRange((await db.QueryAsync(con, """
                 SELECT
                        CASE
-                           WHEN TIME(v.fecha) >= '08:00:00' AND TIME(v.fecha) < '20:00:00' THEN DATE(v.fecha)
-                           WHEN TIME(v.fecha) >= '20:00:00' THEN DATE(v.fecha)
-                           ELSE DATE(DATE_SUB(v.fecha, INTERVAL 1 DAY))
+                           WHEN UPPER(COALESCE(NULLIF(v.turno,''), CASE WHEN TIME(v.fecha) >= '08:00:00' AND TIME(v.fecha) < '20:00:00' THEN 'MAÑANA' ELSE 'NOCHE' END)) = 'NOCHE'
+                                AND TIME(v.fecha) < '20:00:00'
+                               THEN DATE(DATE_SUB(v.fecha, INTERVAL 1 DAY))
+                           ELSE DATE(v.fecha)
                        END AS fecha_turno,
-                       CASE
+                       COALESCE(NULLIF(v.turno,''), CASE
                            WHEN TIME(v.fecha) >= '08:00:00' AND TIME(v.fecha) < '20:00:00' THEN 'MAÑANA'
                            ELSE 'NOCHE'
-                       END AS turno,
+                       END) AS turno,
                        MIN(TRIM(d.producto)) AS producto,
                        MIN(TRIM(d.presentacion)) AS presentacion,
                        SUM(d.cantidad) AS cantidad_total,
                        SUM(d.subtotal) AS total_vendido,
                        COUNT(DISTINCT v.id) AS operaciones
-                FROM detalle_ventas d
-                INNER JOIN ventas v ON v.id = d.venta_id
+                FROM detalle_ventas_canonico d
+                INNER JOIN ventas_canonicas v ON v.id = d.venta_id
                 WHERE v.sucursal_id = @sucursal_id
                 GROUP BY fecha_turno, turno, LOWER(TRIM(d.producto)), LOWER(TRIM(d.presentacion))
                 ORDER BY fecha_turno DESC, turno, producto, presentacion;
@@ -5168,25 +5306,42 @@ public sealed class SheetsReporter
                     SELECT DATE(c.fecha_cierre) AS fecha,
                            c.turno,
                            CASE WHEN COALESCE(c.cajero_nombre, '') <> '' THEN c.cajero_nombre ELSE c.cajero_usuario END AS cajero,
-                           CASE WHEN EXISTS (SELECT 1 FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
-                                THEN (SELECT COUNT(*) FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                           CASE WHEN EXISTS (SELECT 1 FROM ventas_canonicas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                THEN (SELECT COUNT(*) FROM ventas_canonicas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
                                 ELSE c.transacciones_total END AS transacciones_total,
-                           CASE WHEN EXISTS (SELECT 1 FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
-                                THEN (SELECT COALESCE(SUM(vx.efectivo),0) FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                           CASE WHEN EXISTS (SELECT 1 FROM ventas_canonicas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                THEN (SELECT COALESCE(SUM(vx.efectivo),0) FROM ventas_canonicas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
                                 ELSE c.efectivo END AS efectivo,
-                           CASE WHEN EXISTS (SELECT 1 FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
-                                THEN (SELECT COALESCE(SUM(vx.qr),0) FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                           CASE WHEN EXISTS (SELECT 1 FROM ventas_canonicas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                THEN (SELECT COALESCE(SUM(vx.qr),0) FROM ventas_canonicas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
                                 ELSE c.qr END AS qr,
-                           CASE WHEN EXISTS (SELECT 1 FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
-                                THEN (SELECT COALESCE(SUM(CASE WHEN UPPER(vx.metodo_pago)='TRANSFERENCIA' THEN vx.total ELSE 0 END),0) FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                           CASE WHEN EXISTS (SELECT 1 FROM ventas_canonicas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                THEN (SELECT COALESCE(SUM(CASE WHEN UPPER(vx.metodo_pago)='TRANSFERENCIA' THEN vx.total ELSE 0 END),0) FROM ventas_canonicas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
                                 ELSE c.transferencia END AS transferencia,
-                           c.productos_total, c.mesas_total, c.propinas_total, c.comisiones_total,
+                           CASE WHEN EXISTS (SELECT 1 FROM ventas_canonicas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                THEN (SELECT COALESCE(SUM(CASE
+                                           WHEN UPPER(vx.tipo) IN ('DIRECTA','CONSUMO_MESA') THEN vx.total
+                                           WHEN UPPER(vx.tipo)='MESA' THEN LEAST(vx.total, COALESCE(dt.detalle_total,0))
+                                           ELSE 0 END),0)
+                                      FROM ventas_canonicas vx
+                                      LEFT JOIN (SELECT venta_id, SUM(subtotal) AS detalle_total FROM detalle_ventas_canonico GROUP BY venta_id) dt ON dt.venta_id=vx.id
+                                      WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                ELSE c.productos_total END AS productos_total,
+                           CASE WHEN EXISTS (SELECT 1 FROM ventas_canonicas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                THEN (SELECT COALESCE(SUM(CASE
+                                           WHEN UPPER(vx.tipo)='MESA' THEN GREATEST(vx.total - LEAST(vx.total, COALESCE(dt.detalle_total,0)),0)
+                                           ELSE 0 END),0)
+                                      FROM ventas_canonicas vx
+                                      LEFT JOIN (SELECT venta_id, SUM(subtotal) AS detalle_total FROM detalle_ventas_canonico GROUP BY venta_id) dt ON dt.venta_id=vx.id
+                                      WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                ELSE c.mesas_total END AS mesas_total,
+                           c.propinas_total, c.comisiones_total,
                            c.gastos_total, c.perdidas_total,
-                           CASE WHEN EXISTS (SELECT 1 FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
-                                THEN (SELECT COALESCE(SUM(vx.total),0) FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                           CASE WHEN EXISTS (SELECT 1 FROM ventas_canonicas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                THEN (SELECT COALESCE(SUM(vx.total),0) FROM ventas_canonicas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
                                 ELSE c.total_generado END AS total_generado,
-                           CASE WHEN EXISTS (SELECT 1 FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
-                                THEN (SELECT COALESCE(SUM(vx.total),0) FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin) - c.gastos_total
+                           CASE WHEN EXISTS (SELECT 1 FROM ventas_canonicas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                THEN (SELECT COALESCE(SUM(vx.total),0) FROM ventas_canonicas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin) - c.gastos_total
                                 ELSE c.neto_turno END AS neto_turno,
                            c.observaciones,
                            CASE

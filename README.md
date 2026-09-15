@@ -1,13 +1,15 @@
-# BILLAR EL BRUJO API V57 - RELEVO + TRANSFERENCIA + ANTI DUPLICADO
+# BILLAR EL BRUJO API V60
 
-Archivos necesarios para Railway solamente.
+API limpia para Railway.
 
-Cambios V57:
-- exige Caja/Admin V137 o superior;
-- TRANSFERENCIA válida como método de pago;
-- arqueo reconcilia efectivo, QR, transferencia y total contra ventas únicas;
-- un cierre existente se vuelve a conciliar si las ventas llegaron después (sin crear un segundo cierre);
-- Google Sheets muestra transferencia en VENTAS y CIERRES;
-- OperationKey, SyncKey, session_id y consumption_key mantienen las defensas anti duplicado.
+## V60 - Pago de productos sin cerrar mesa
+- Compatible con Caja/Admin V140 o superior.
+- Permite múltiples pagos parciales legítimos en una misma sesión de mesa.
+- Cada línea parcial exige `ConsumptionKey` única.
+- `OperationKey` + `SyncKey` mantienen idempotencia de la venta.
+- Locks MySQL por `ConsumptionKey` bloquean dos cobros simultáneos del mismo producto.
+- `detalle_ventas.consumption_key` es único: un producto ya pagado no puede reaparecer en otro cobro.
+- El cobro final de mesa sigue siendo único por sesión.
+- Reportes, arqueos y Google Sheets leen ventas canónicas para evitar inflación histórica.
 
-No borra ventas ni inventario existentes.
+No incluye migraciones manuales ni archivos de prueba; el esquema faltante se crea de forma segura al iniciar.
