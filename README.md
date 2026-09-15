@@ -1,30 +1,13 @@
-# Billar El Brujo API V56
+# BILLAR EL BRUJO API V57 - RELEVO + TRANSFERENCIA + ANTI DUPLICADO
 
-API limpia para Railway. Version: `V56_ARQUEO_EXCEL_CAJA_ANTI_DUPLICADO`.
+Archivos necesarios para Railway solamente.
 
-## Archivos necesarios
-- `Program.cs`
-- `BillarElBrujoApi.csproj`
-- `Dockerfile`
-- `railway.toml`
-- `README.md`
+Cambios V57:
+- exige Caja/Admin V137 o superior;
+- TRANSFERENCIA válida como método de pago;
+- arqueo reconcilia efectivo, QR, transferencia y total contra ventas únicas;
+- un cierre existente se vuelve a conciliar si las ventas llegaron después (sin crear un segundo cierre);
+- Google Sheets muestra transferencia en VENTAS y CIERRES;
+- OperationKey, SyncKey, session_id y consumption_key mantienen las defensas anti duplicado.
 
-## Correcciones V56
-- Guarda `caja_nombre` y `turno` reales en cada venta.
-- Backfill de ventas antiguas: turno por hora real del cobro y caja por usuario/sucursal cuando falta.
-- `/api/ventas` devuelve caja y turno y aumenta el limite de lectura para reportes administrativos.
-- El cierre de turno se concilia en servidor contra las ventas confirmadas de ese cajero y ventana horaria antes de guardarse.
-- Google Sheets concilia cierres antiguos contra ventas reales cuando existen ventas para esa ventana.
-- Mantiene proteccion por `sync_key`, `operation_key`, sesion final, `consumption_key` y movimientos de inventario idempotentes.
-- Reportes de EL BRUJO y EL BRUJO PREMIU permanecen separados.
-
-## Variables Railway
-- `MYSQL_URL = ${{MySQL.MYSQL_URL}}`
-- `GOOGLE_SHEET_ID`
-- `GOOGLE_CREDENTIALS_JSON`
-
-## Comprobacion
-- `GET /health`
-- Debe indicar MySQL conectado y Google Sheets configurado.
-
-No subir credenciales de Google al repositorio.
+No borra ventas ni inventario existentes.

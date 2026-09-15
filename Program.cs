@@ -61,7 +61,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
         return Results.Ok(new
         {
             ok = true,
-            version = "V56_ARQUEO_EXCEL_CAJA_ANTI_DUPLICADO",
+            version = "V57_RELEVO_TRANSFERENCIA_ANTI_DUPLICADO",
             database,
             mysql = "conectado",
             googleSheets = sheets.IsConfigured ? "configurado" : "faltan variables GOOGLE_SHEET_ID y GOOGLE_CREDENTIALS_JSON"
@@ -76,10 +76,10 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
 app.MapGet("/api/system/version", () => Results.Ok(new
 {
     ok = true,
-    apiVersion = "V56_ARQUEO_EXCEL_CAJA_ANTI_DUPLICADO",
-    minimumClientVersion = 132,
+    apiVersion = "V57_RELEVO_TRANSFERENCIA_ANTI_DUPLICADO",
+    minimumClientVersion = 137,
     accountingMode = "LIBRO_INMUTABLE_TRANSACCIONAL",
-    message = "Se requiere Caja/Admin V134 para arqueo conciliado, reporte por caja en Excel y protección contable actual."
+    message = "Se requiere Caja/Admin V137 para relevo seguro, transferencia, arqueo conciliado y protección anti duplicado."
 }));
 
 app.MapGet("/api/sheets/status", (SheetsReporter sheets) =>
@@ -1750,7 +1750,7 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
         // V45: bloqueo de cajas antiguas. Evita que una versión sin OperationKey/cola offline
         // vuelva a inflar ventas o stock.
         if (!venta.ClientVersion.HasValue || venta.ClientVersion.Value < 132)
-            return Results.Json(new { ok = false, message = "Caja desactualizada. Se requiere V132 o superior para registrar cobros en Railway.", minimumClientVersion = 132 }, statusCode: StatusCodes.Status426UpgradeRequired);
+            return Results.Json(new { ok = false, message = "Caja desactualizada. Se requiere V132 o superior para registrar cobros en Railway.", minimumClientVersion = 137 }, statusCode: StatusCodes.Status426UpgradeRequired);
 
         string syncKey = string.IsNullOrWhiteSpace(venta.SyncKey)
             ? Guid.NewGuid().ToString("N")
@@ -1762,7 +1762,7 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
         // V47: toda Caja V128+ debe traer las dos identidades. Si falta una, NO se inventa
         // una nueva en el servidor, porque eso podría transformar un reintento en otra venta.
         if (string.IsNullOrWhiteSpace(venta.SyncKey) || string.IsNullOrWhiteSpace(operationKey))
-            return Results.BadRequest(new { ok = false, message = "El cobro llegó sin SyncKey u OperationKey. Se bloqueó para evitar duplicación.", minimumClientVersion = 132 });
+            return Results.BadRequest(new { ok = false, message = "El cobro llegó sin SyncKey u OperationKey. Se bloqueó para evitar duplicación.", minimumClientVersion = 137 });
 
         // V54: candados de servidor. Serializan reintentos simultáneos aunque una base histórica
         // todavía no haya podido crear todos los índices UNIQUE por duplicados antiguos.
@@ -1877,6 +1877,7 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
         {
             "EFECTIVO" => Math.Abs(Math.Max(0, venta.Efectivo) - totalSeguro) < 0.01m && Math.Abs(venta.Qr) < 0.01m,
             "QR" => Math.Abs(Math.Max(0, venta.Qr) - totalSeguro) < 0.01m && Math.Abs(venta.Efectivo) < 0.01m,
+            "TRANSFERENCIA" => Math.Abs(venta.Efectivo) < 0.01m && Math.Abs(venta.Qr) < 0.01m && totalSeguro > 0m,
             "MIXTO" => Math.Abs(sumaPago - totalSeguro) < 0.01m,
             _ => false
         };
@@ -2297,7 +2298,7 @@ app.MapGet("/api/admin/conciliacion", async (Db db, string? clave, int? sucursal
         SELECT
             COALESCE((SELECT SUM(total) FROM ventas WHERE (@sucursalId IS NULL OR sucursal_id=@sucursalId)),0) AS ventas_total,
             COALESCE((SELECT SUM(total) FROM libro_caja WHERE estado='CONFIRMADA' AND (@sucursalId IS NULL OR sucursal_id=@sucursalId)),0) AS libro_total,
-            COALESCE((SELECT SUM(efectivo+qr) FROM libro_caja WHERE estado='CONFIRMADA' AND (@sucursalId IS NULL OR sucursal_id=@sucursalId)),0) AS medios_total,
+            COALESCE((SELECT SUM(efectivo+qr+CASE WHEN UPPER(metodo_pago)='TRANSFERENCIA' THEN total ELSE 0 END) FROM libro_caja WHERE estado='CONFIRMADA' AND (@sucursalId IS NULL OR sucursal_id=@sucursalId)),0) AS medios_total,
             COALESCE((SELECT COUNT(*) FROM ventas WHERE (@sucursalId IS NULL OR sucursal_id=@sucursalId)),0) AS ventas_count,
             COALESCE((SELECT COUNT(*) FROM libro_caja WHERE estado='CONFIRMADA' AND (@sucursalId IS NULL OR sucursal_id=@sucursalId)),0) AS libro_count;
     """;
@@ -2710,8 +2711,10 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
     int canonicalTransactions = Math.Max(0, r.TransaccionesTotal);
     int canonicalCashTransactions = Math.Max(0, r.TransaccionesEfectivo);
     int canonicalQrTransactions = Math.Max(0, r.TransaccionesQr);
+    int canonicalTransferTransactions = Math.Max(0, r.TransaccionesTransferencia);
     decimal canonicalCash = Math.Max(0, r.Efectivo);
     decimal canonicalQr = Math.Max(0, r.Qr);
+    decimal canonicalTransfer = Math.Max(0, r.Transferencia);
     decimal canonicalTotal = Math.Max(0, r.TotalGenerado);
     bool reconciledFromSales = false;
 
@@ -2722,8 +2725,10 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
             SELECT COUNT(*) AS operaciones,
                    COALESCE(SUM(CASE WHEN efectivo > 0 THEN 1 ELSE 0 END),0) AS ops_efectivo,
                    COALESCE(SUM(CASE WHEN qr > 0 THEN 1 ELSE 0 END),0) AS ops_qr,
+                   COALESCE(SUM(CASE WHEN UPPER(metodo_pago)='TRANSFERENCIA' THEN 1 ELSE 0 END),0) AS ops_transferencia,
                    COALESCE(SUM(efectivo),0) AS efectivo,
                    COALESCE(SUM(qr),0) AS qr,
+                   COALESCE(SUM(CASE WHEN UPPER(metodo_pago)='TRANSFERENCIA' THEN total ELSE 0 END),0) AS transferencia,
                    COALESCE(SUM(total),0) AS total
             FROM ventas
             WHERE sucursal_id = @sucursal_id
@@ -2743,8 +2748,10 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
                 canonicalTransactions = count;
                 canonicalCashTransactions = Convert.ToInt32(rr["ops_efectivo"] ?? 0);
                 canonicalQrTransactions = Convert.ToInt32(rr["ops_qr"] ?? 0);
+                canonicalTransferTransactions = Convert.ToInt32(rr["ops_transferencia"] ?? 0);
                 canonicalCash = Convert.ToDecimal(rr["efectivo"] ?? 0m);
                 canonicalQr = Convert.ToDecimal(rr["qr"] ?? 0m);
+                canonicalTransfer = Convert.ToDecimal(rr["transferencia"] ?? 0m);
                 canonicalTotal = Convert.ToDecimal(rr["total"] ?? 0m);
                 reconciledFromSales = true;
             }
@@ -2775,7 +2782,31 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
             @cortesias_valor, @comisiones_total, @gastos_total, @perdidas_total,
             @total_generado, @neto_turno, @observaciones, @detalle_json, @sync_key
         )
-        ON DUPLICATE KEY UPDATE sync_key = VALUES(sync_key);
+        ON DUPLICATE KEY UPDATE
+            fecha_cierre = VALUES(fecha_cierre),
+            transacciones_total = VALUES(transacciones_total),
+            transacciones_efectivo = VALUES(transacciones_efectivo),
+            transacciones_qr = VALUES(transacciones_qr),
+            transacciones_tarjeta = VALUES(transacciones_tarjeta),
+            transacciones_transferencia = VALUES(transacciones_transferencia),
+            efectivo = VALUES(efectivo),
+            qr = VALUES(qr),
+            tarjeta = VALUES(tarjeta),
+            transferencia = VALUES(transferencia),
+            sin_metodo = VALUES(sin_metodo),
+            productos_total = VALUES(productos_total),
+            mesas_total = VALUES(mesas_total),
+            minutos_jugados = VALUES(minutos_jugados),
+            propinas_total = VALUES(propinas_total),
+            cortesias_valor = VALUES(cortesias_valor),
+            comisiones_total = VALUES(comisiones_total),
+            gastos_total = VALUES(gastos_total),
+            perdidas_total = VALUES(perdidas_total),
+            total_generado = VALUES(total_generado),
+            neto_turno = VALUES(neto_turno),
+            observaciones = VALUES(observaciones),
+            detalle_json = VALUES(detalle_json),
+            sync_key = VALUES(sync_key);
     """;
 
     await using (var cmd = new MySqlCommand(sql, con))
@@ -2794,11 +2825,11 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
         cmd.Parameters.AddWithValue("@transacciones_efectivo", canonicalCashTransactions);
         cmd.Parameters.AddWithValue("@transacciones_qr", canonicalQrTransactions);
         cmd.Parameters.AddWithValue("@transacciones_tarjeta", Math.Max(0, r.TransaccionesTarjeta));
-        cmd.Parameters.AddWithValue("@transacciones_transferencia", Math.Max(0, r.TransaccionesTransferencia));
+        cmd.Parameters.AddWithValue("@transacciones_transferencia", reconciledFromSales ? canonicalTransferTransactions : Math.Max(0, r.TransaccionesTransferencia));
         cmd.Parameters.AddWithValue("@efectivo", canonicalCash);
         cmd.Parameters.AddWithValue("@qr", canonicalQr);
         cmd.Parameters.AddWithValue("@tarjeta", Math.Max(0, r.Tarjeta));
-        cmd.Parameters.AddWithValue("@transferencia", Math.Max(0, r.Transferencia));
+        cmd.Parameters.AddWithValue("@transferencia", reconciledFromSales ? canonicalTransfer : Math.Max(0, r.Transferencia));
         cmd.Parameters.AddWithValue("@sin_metodo", Math.Max(0, r.SinMetodo));
         cmd.Parameters.AddWithValue("@productos_total", Math.Max(0, r.ProductosTotal));
         cmd.Parameters.AddWithValue("@mesas_total", Math.Max(0, r.MesasTotal));
@@ -2824,7 +2855,7 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
     }
 
     await TrySyncSheets(db, sheets);
-    return Results.Ok(new { ok = true, id, syncKey, reconciledFromSales, canonicalTransactions, canonicalCash, canonicalQr, canonicalTotal, message = reconciledFromSales ? "Arqueo guardado y conciliado contra ventas únicas de Railway." : "Arqueo guardado para Administración." });
+    return Results.Ok(new { ok = true, id, syncKey, reconciledFromSales, canonicalTransactions, canonicalCash, canonicalQr, canonicalTransfer, canonicalTotal, message = reconciledFromSales ? "Arqueo guardado y conciliado contra ventas únicas de Railway, incluida transferencia." : "Arqueo guardado para Administración." });
 });
 
 app.MapGet("/api/admin/cierres-turno", async (Db db, string clave, int? sucursalId) =>
@@ -4973,7 +5004,7 @@ public sealed class SheetsReporter
             // ya impide que un reintento vuelva a crear el mismo cobro.
             List<List<object>> ventas = new()
             {
-                new() { "id_venta", "fecha_turno", "turno", "fecha", "hora", "cajero", "tipo", "metodo_pago", "efectivo", "qr", "total", "caja" }
+                new() { "id_venta", "fecha_turno", "turno", "fecha", "hora", "cajero", "tipo", "metodo_pago", "efectivo", "qr", "transferencia", "total", "caja" }
             };
             ventas.AddRange((await db.QueryAsync(con, """
                 SELECT v.id,
@@ -4990,6 +5021,7 @@ public sealed class SheetsReporter
                        v.cajero, v.tipo, v.metodo_pago,
                        COALESCE(v.efectivo, 0) AS efectivo,
                        COALESCE(v.qr, 0) AS qr,
+                       CASE WHEN UPPER(v.metodo_pago)='TRANSFERENCIA' THEN v.total ELSE 0 END AS transferencia,
                        v.total,
                        CASE
                            WHEN v.sucursal_id = 1 THEN 'CAJA ÚNICA'
@@ -5004,7 +5036,7 @@ public sealed class SheetsReporter
             """, args)).Select(r => new List<object>
             {
                 Val(r, "id"), DateOnlyText(r, "fecha_turno"), Text(r, "turno"), DateOnlyText(r, "fecha"), Text(r, "hora"),
-                Text(r, "cajero"), Text(r, "tipo"), Text(r, "metodo_pago"), Val(r, "efectivo"), Val(r, "qr"), Val(r, "total"), Text(r, "caja")
+                Text(r, "cajero"), Text(r, "tipo"), Text(r, "metodo_pago"), Val(r, "efectivo"), Val(r, "qr"), Val(r, "transferencia"), Val(r, "total"), Text(r, "caja")
             }));
 
             // V53: PRODUCTOS es un resumen diario. El mismo producto/presentación aparece
@@ -5125,7 +5157,7 @@ public sealed class SheetsReporter
                 new()
                 {
                     "fecha", "turno", "cajero", "transacciones",
-                    "efectivo", "qr", "productos", "mesas", "propinas", "comisiones_meseras",
+                    "efectivo", "qr", "transferencia", "productos", "mesas", "propinas", "comisiones_meseras",
                     "gastos", "perdidas", "total_generado", "neto_turno", "observaciones", "caja"
                 }
             };
@@ -5145,6 +5177,9 @@ public sealed class SheetsReporter
                            CASE WHEN EXISTS (SELECT 1 FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
                                 THEN (SELECT COALESCE(SUM(vx.qr),0) FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
                                 ELSE c.qr END AS qr,
+                           CASE WHEN EXISTS (SELECT 1 FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                THEN (SELECT COALESCE(SUM(CASE WHEN UPPER(vx.metodo_pago)='TRANSFERENCIA' THEN vx.total ELSE 0 END),0) FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
+                                ELSE c.transferencia END AS transferencia,
                            c.productos_total, c.mesas_total, c.propinas_total, c.comisiones_total,
                            c.gastos_total, c.perdidas_total,
                            CASE WHEN EXISTS (SELECT 1 FROM ventas vx WHERE vx.sucursal_id=c.sucursal_id AND vx.cajero=c.cajero_usuario AND vx.fecha>=c.inicio AND vx.fecha<c.fin)
@@ -5166,7 +5201,7 @@ public sealed class SheetsReporter
                 """, args)).Select(r => new List<object>
                 {
                     DateOnlyText(r, "fecha"), Text(r, "turno"), Text(r, "cajero"), Val(r, "transacciones_total"),
-                    Val(r, "efectivo"), Val(r, "qr"), Val(r, "productos_total"), Val(r, "mesas_total"),
+                    Val(r, "efectivo"), Val(r, "qr"), Val(r, "transferencia"), Val(r, "productos_total"), Val(r, "mesas_total"),
                     Val(r, "propinas_total"), Val(r, "comisiones_total"), Val(r, "gastos_total"), Val(r, "perdidas_total"),
                     Val(r, "total_generado"), Val(r, "neto_turno"), Text(r, "observaciones"), Text(r, "caja_reporte")
                 }));
