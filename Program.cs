@@ -6426,7 +6426,10 @@ public static class CompositeInventoryDb
 
     static bool TryAllocate(List<StockProduct> all, string productName, decimal saleQty, out List<StockPart> parts, out string error)
     {
-        parts = new List<StockPart>();
+        // CS1628 fix: an out/ref/in parameter cannot be captured by a local function.
+        // Build the allocation in a normal local list and expose that same list through `parts`.
+        var allocatedParts = new List<StockPart>();
+        parts = allocatedParts;
         error = "";
         saleQty = Math.Max(1M, saleQty);
         string n = N(productName);
@@ -6434,7 +6437,7 @@ public static class CompositeInventoryDb
         void Need(StockProduct? p, decimal units, string label)
         {
             if (p == null) throw new InvalidOperationException("No está configurado en el catálogo: " + label + ".");
-            parts.Add(new StockPart { ProductId = p.Id, ProductName = p.Name, Units = units });
+            allocatedParts.Add(new StockPart { ProductId = p.Id, ProductName = p.Name, Units = units });
         }
 
         try
@@ -6462,7 +6465,7 @@ public static class CompositeInventoryDb
                         decimal take = Math.Min(remain, available);
                         if (take > 0)
                         {
-                            parts.Add(new StockPart { ProductId = soda.Id, ProductName = soda.Name, Units = take });
+                            allocatedParts.Add(new StockPart { ProductId = soda.Id, ProductName = soda.Name, Units = take });
                             remain -= take;
                         }
                     }
@@ -6487,7 +6490,7 @@ public static class CompositeInventoryDb
         }
         catch (Exception ex) { error = ex.Message; return false; }
 
-        foreach (StockPart part in parts)
+        foreach (StockPart part in allocatedParts)
         {
             StockProduct? p = all.FirstOrDefault(x => x.Id == part.ProductId);
             if (p == null) { error = "Producto componente no encontrado."; return false; }
