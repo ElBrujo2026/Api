@@ -33,6 +33,7 @@ try
     await EnsureCoreSchemaAsync(startupCon);
     await EnsureUserManagementTables(startupCon);
     await EnsureSectorLayoutAsync(startupCon);
+    await EnsurePremiumSharedCatalogAsync(startupCon);
     await EnsureMesasEnVivoTables(startupCon);
     await EnsureOfficialBranchAndTableLayout(startupCon);
     await EnsureTablePricingAsync(startupCon);
@@ -68,7 +69,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
         return Results.Ok(new
         {
             ok = true,
-            version = "V66_INVENTARIO_COMPUESTO_COMISION_5",
+            version = "V70_PREMIU_CATALOGO_COMPARTIDO",
             database,
             mysql = "conectado",
             googleSheets = sheets.IsConfigured ? "configurado" : "faltan variables GOOGLE_SHEET_ID y GOOGLE_CREDENTIALS_JSON",
@@ -86,10 +87,10 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
 app.MapGet("/api/system/version", () => Results.Ok(new
 {
     ok = true,
-    apiVersion = "V66_INVENTARIO_COMPUESTO_COMISION_5",
-    minimumClientVersion = 145,
+    apiVersion = "V70_PREMIU_CATALOGO_COMPARTIDO",
+    minimumClientVersion = 149,
     accountingMode = "LIBRO_INMUTABLE_TRANSACCIONAL",
-    message = "Caja/Admin V147 compatible. EL BRUJO PREMIU usa inventarios separados ARRIBA/ABAJO; EL BRUJO usa GENERAL. Google Sheets publica reportes separados por sucursal y sector con diagnóstico de sincronización. Mantiene pago parcial seguro, contabilidad canónica y anti duplicado."
+    message = "Caja/Admin V149 compatible. EL BRUJO PREMIU usa un solo catálogo/inventario compartido entre ARRIBA y ABAJO; las cajas, turnos y reportes siguen separados. Mantiene inventario delta idempotente, pago parcial seguro y contabilidad anti duplicado."
 }));
 
 app.MapGet("/api/sheets/status", (SheetsReporter sheets) =>
@@ -125,22 +126,21 @@ app.MapGet("/api/sheets/debug", async (Db db, SheetsReporter sheets) =>
         long cierresBrujo = await CountAsync("SELECT COUNT(*) FROM cierres_turno WHERE sucursal_id=1;");
         long cierresPremiu = await CountAsync("SELECT COUNT(*) FROM cierres_turno WHERE sucursal_id=2;");
         long productosBrujo = await CountAsync("SELECT COUNT(*) FROM productos WHERE sucursal_id=1 AND estado='ACTIVO';");
-        long productosPremiuArriba = await CountAsync("SELECT COUNT(*) FROM productos WHERE sucursal_id=2 AND sector='ARRIBA' AND estado='ACTIVO';");
-        long productosPremiuAbajo = await CountAsync("SELECT COUNT(*) FROM productos WHERE sucursal_id=2 AND sector='ABAJO' AND estado='ACTIVO';");
+        long productosPremiu = await CountAsync("SELECT COUNT(*) FROM productos WHERE sucursal_id=2 AND estado='ACTIVO';");
 
         string? ultimaVenta = Convert.ToString(await new MySqlCommand("SELECT DATE_FORMAT(MAX(fecha),'%Y-%m-%d %H:%i:%s') FROM ventas_canonicas;", con).ExecuteScalarAsync());
 
         return Results.Ok(new
         {
             ok = true,
-            apiVersion = "V66_INVENTARIO_COMPUESTO_COMISION_5",
+            apiVersion = "V70_PREMIU_CATALOGO_COMPARTIDO",
             googleSheetsConfigured = sheets.IsConfigured,
             spreadsheetId = sheets.SpreadsheetId,
             ventasRaw,
             ventasCanonicas,
             duplicadosIgnorados = Math.Max(0, ventasRaw - ventasCanonicas),
             elBrujo = new { ventas = brujoVentas, cierres = cierresBrujo, productos = productosBrujo },
-            elBrujoPremiu = new { ventas = premiuVentas, cierres = cierresPremiu, productosArriba = productosPremiuArriba, productosAbajo = productosPremiuAbajo },
+            elBrujoPremiu = new { ventas = premiuVentas, cierres = cierresPremiu, productosCompartidos = productosPremiu },
             ultimaVenta
         });
     }
@@ -429,7 +429,7 @@ app.MapPost("/api/admin/productos/comision", async (Db db, string clave, Product
 
     decimal valor = genera ? req.ValorComision : 0;
     int sucursalId = req.SucursalId <= 0 ? 1 : req.SucursalId;
-    string sector = NormalizarSector(sucursalId, req.Sector);
+    string sector = NormalizarSectorProducto(sucursalId);
 
     const string sql = """
         UPDATE productos
@@ -438,6 +438,7 @@ app.MapPost("/api/admin/productos/comision", async (Db db, string clave, Product
             valor_comision = @valor_comision
         WHERE sucursal_id = @sucursal_id
           AND sector = @sector
+          AND estado = 'ACTIVO'
           AND LOWER(nombre) = LOWER(@nombre);
     """;
 
@@ -497,7 +498,7 @@ app.MapPost("/api/admin/productos/guardar", async (Db db, SheetsReporter sheets,
     if (clave != cleanKey) return Results.Unauthorized();
 
     int sucursalId = req.SucursalId == 2 ? 2 : 1;
-    string sector = NormalizarSector(sucursalId, req.Sector);
+    string sector = NormalizarSectorProducto(sucursalId);
     string nombre = (req.Nombre ?? "").Trim();
     if (string.IsNullOrWhiteSpace(nombre))
         return Results.BadRequest(new { ok = false, message = "Nombre del producto requerido." });
@@ -525,7 +526,7 @@ app.MapPost("/api/admin/productos/guardar", async (Db db, SheetsReporter sheets,
         // un producto sin crear un duplicado en Railway.
         if (req.ProductoId.GetValueOrDefault() > 0)
         {
-            await using var buscarId = new MySqlCommand("SELECT id FROM productos WHERE id = @id AND sucursal_id = @sucursal_id AND sector = @sector LIMIT 1;", con, tx);
+            await using var buscarId = new MySqlCommand("SELECT id FROM productos WHERE id = @id AND sucursal_id = @sucursal_id AND sector = @sector AND estado='ACTIVO' LIMIT 1;", con, tx);
             buscarId.Parameters.AddWithValue("@id", req.ProductoId!.Value);
             buscarId.Parameters.AddWithValue("@sucursal_id", sucursalId);
             buscarId.Parameters.AddWithValue("@sector", sector);
@@ -535,7 +536,7 @@ app.MapPost("/api/admin/productos/guardar", async (Db db, SheetsReporter sheets,
 
         if (productoId <= 0)
         {
-            await using var buscar = new MySqlCommand("SELECT id FROM productos WHERE sucursal_id = @sucursal_id AND sector = @sector AND LOWER(TRIM(nombre)) = LOWER(TRIM(@nombre)) LIMIT 1;", con, tx);
+            await using var buscar = new MySqlCommand("SELECT id FROM productos WHERE sucursal_id = @sucursal_id AND sector = @sector AND estado='ACTIVO' AND LOWER(TRIM(nombre)) = LOWER(TRIM(@nombre)) ORDER BY id LIMIT 1;", con, tx);
             buscar.Parameters.AddWithValue("@sucursal_id", sucursalId);
             buscar.Parameters.AddWithValue("@sector", sector);
             buscar.Parameters.AddWithValue("@nombre", nombre);
@@ -689,7 +690,7 @@ app.MapPost("/api/admin/productos/ajustar-stock", async (Db db, string clave, Ad
     if (req.Delta == 0) return Results.BadRequest(new { ok = false, message = "El ajuste no puede ser cero." });
 
     int sucursalId = req.SucursalId == 2 ? 2 : 1;
-    string sector = NormalizarSector(sucursalId, req.Sector);
+    string sector = NormalizarSectorProducto(sucursalId);
     string nombre = (req.Nombre ?? "").Trim();
 
     await using var con = await db.OpenAsync();
@@ -713,7 +714,7 @@ app.MapPost("/api/admin/productos/ajustar-stock", async (Db db, string clave, Ad
         long productoId = 0;
         if (req.ProductoId.GetValueOrDefault() > 0)
         {
-            await using var q = new MySqlCommand("SELECT id FROM productos WHERE id=@id AND sucursal_id=@s AND sector=@sector LIMIT 1;", con, tx);
+            await using var q = new MySqlCommand("SELECT id FROM productos WHERE id=@id AND sucursal_id=@s AND sector=@sector AND estado='ACTIVO' LIMIT 1;", con, tx);
             q.Parameters.AddWithValue("@id", req.ProductoId!.Value);
             q.Parameters.AddWithValue("@s", sucursalId);
             q.Parameters.AddWithValue("@sector", sector);
@@ -722,7 +723,7 @@ app.MapPost("/api/admin/productos/ajustar-stock", async (Db db, string clave, Ad
         }
         if (productoId <= 0 && !string.IsNullOrWhiteSpace(nombre))
         {
-            await using var q = new MySqlCommand("SELECT id FROM productos WHERE sucursal_id=@s AND sector=@sector AND LOWER(TRIM(nombre))=LOWER(TRIM(@n)) LIMIT 1;", con, tx);
+            await using var q = new MySqlCommand("SELECT id FROM productos WHERE sucursal_id=@s AND sector=@sector AND estado='ACTIVO' AND LOWER(TRIM(nombre))=LOWER(TRIM(@n)) ORDER BY id LIMIT 1;", con, tx);
             q.Parameters.AddWithValue("@s", sucursalId);
             q.Parameters.AddWithValue("@sector", sector);
             q.Parameters.AddWithValue("@n", nombre);
@@ -785,12 +786,12 @@ app.MapGet("/api/admin/productos/detalle", async (Db db, string clave, int sucur
     await using var con = await db.OpenAsync();
     await EnsureAppMeseraTables(con);
     await EnsureSectorLayoutAsync(con);
+    await EnsurePremiumSharedCatalogAsync(con);
 
     int sid = sucursalId == 2 ? 2 : 1;
-    string sectorFiltro = string.IsNullOrWhiteSpace(sector) ? "" : NormalizarSector(sid, sector);
 
     const string sql = """
-        SELECT p.id AS producto_id, p.sucursal_id, p.sector, p.nombre, p.categoria, p.unidad_base,
+        SELECT p.id AS producto_id, p.sucursal_id, 'GENERAL' AS sector, p.nombre, p.categoria, p.unidad_base,
                p.stock_actual, p.stock_minimo, COALESCE(p.sin_limite_stock,0) AS sin_limite_stock,
                COALESCE(p.tipo_entrada,'PAQUETE') AS tipo_entrada,
                COALESCE(p.unidades_por_entrada,1) AS unidades_por_entrada,
@@ -803,21 +804,19 @@ app.MapGet("/api/admin/productos/detalle", async (Db db, string clave, int sucur
                pr.cantidad_base, pr.precio_venta, pr.estado AS presentacion_estado
         FROM productos p
         INNER JOIN (
-            SELECT sucursal_id, sector, LOWER(TRIM(nombre)) AS nombre_norm,
+            SELECT sucursal_id, LOWER(TRIM(nombre)) AS nombre_norm,
                    COALESCE(MIN(CASE WHEN estado='ACTIVO' THEN id END), MIN(id)) AS id_canonico
             FROM productos
-            GROUP BY sucursal_id, sector, LOWER(TRIM(nombre))
+            GROUP BY sucursal_id, LOWER(TRIM(nombre))
         ) canon ON canon.id_canonico = p.id
         LEFT JOIN presentaciones pr ON pr.producto_id = p.id
         WHERE p.sucursal_id = @sucursal_id
-          AND (@sector = '' OR p.sector = @sector)
-        ORDER BY p.sector, p.categoria, p.nombre, pr.cantidad_base;
+        ORDER BY p.categoria, p.nombre, pr.cantidad_base;
     """;
 
     return Results.Ok(await db.QueryAsync(con, sql, new Dictionary<string, object?>
     {
-        ["@sucursal_id"] = sid,
-        ["@sector"] = sectorFiltro
+        ["@sucursal_id"] = sid
     }));
 });
 
@@ -932,6 +931,7 @@ app.MapGet("/api/app-mesera/productos", async (Db db, int sucursalId, string? us
     await using var con = await db.OpenAsync();
     await EnsureAppMeseraTables(con);
     await EnsureSectorLayoutAsync(con);
+    await EnsurePremiumSharedCatalogAsync(con);
 
     int sid = sucursalId == 2 ? 2 : 1;
     string sectorEfectivo = NormalizarSector(sid, sector);
@@ -948,7 +948,7 @@ app.MapGet("/api/app-mesera/productos", async (Db db, int sucursalId, string? us
 
     const string sql = """
         SELECT p.id AS producto_id,
-               p.sector,
+               @sector AS sector,
                p.nombre AS producto,
                p.categoria,
                p.stock_actual,
@@ -961,14 +961,13 @@ app.MapGet("/api/app-mesera/productos", async (Db db, int sucursalId, string? us
                COALESCE(p.valor_comision, 0) AS valor_comision
         FROM productos p
         INNER JOIN (
-            SELECT sucursal_id, sector, LOWER(TRIM(nombre)) AS nombre_norm,
+            SELECT sucursal_id, LOWER(TRIM(nombre)) AS nombre_norm,
                    COALESCE(MIN(CASE WHEN estado='ACTIVO' THEN id END), MIN(id)) AS id_canonico
             FROM productos
-            GROUP BY sucursal_id, sector, LOWER(TRIM(nombre))
+            GROUP BY sucursal_id, LOWER(TRIM(nombre))
         ) canon ON canon.id_canonico = p.id
         LEFT JOIN presentaciones pr ON pr.producto_id = p.id AND pr.estado = 'ACTIVO'
         WHERE p.sucursal_id = @sucursalId
-          AND p.sector = @sector
           AND p.estado = 'ACTIVO'
         ORDER BY
             CASE
@@ -1119,7 +1118,6 @@ app.MapPost("/api/app-mesera/pedidos", async (Db db, AppPedidoMovilRequest req) 
                 AND pr.estado = 'ACTIVO'
          WHERE p.id = @id
            AND p.sucursal_id = @sucursal_id
-           AND p.sector = @sector
            AND p.estado = 'ACTIVO'
          LIMIT 1;
     """;
@@ -1136,7 +1134,6 @@ app.MapPost("/api/app-mesera/pedidos", async (Db db, AppPedidoMovilRequest req) 
         validar.Parameters.AddWithValue("@id", req.ProductoId);
         validar.Parameters.AddWithValue("@presentacion_id", req.PresentacionId);
         validar.Parameters.AddWithValue("@sucursal_id", req.SucursalId);
-        validar.Parameters.AddWithValue("@sector", sectorPedido);
 
         await using var rd = await validar.ExecuteReaderAsync();
         if (!await rd.ReadAsync())
@@ -1224,7 +1221,6 @@ app.MapPost("/api/app-mesera/pedidos", async (Db db, AppPedidoMovilRequest req) 
                 SET stock_actual = stock_actual - @unidades
                 WHERE id = @producto_id
                   AND sucursal_id = @sucursal_id
-                  AND sector = @sector
                   AND estado = 'ACTIVO'
                   AND COALESCE(sin_limite_stock, 0) = 0
                   AND stock_actual >= @unidades;
@@ -1232,7 +1228,6 @@ app.MapPost("/api/app-mesera/pedidos", async (Db db, AppPedidoMovilRequest req) 
             reservarStock.Parameters.AddWithValue("@unidades", unidadesSolicitadas);
             reservarStock.Parameters.AddWithValue("@producto_id", req.ProductoId);
             reservarStock.Parameters.AddWithValue("@sucursal_id", req.SucursalId);
-            reservarStock.Parameters.AddWithValue("@sector", sectorPedido);
 
             int filas = await reservarStock.ExecuteNonQueryAsync();
             if (filas != 1)
@@ -1415,12 +1410,11 @@ app.MapPost("/api/app-mesera/reportes-producto", async (Db db, ProductReportRequ
                     THEN stock_actual
                     ELSE GREATEST(stock_actual - @unidades, 0)
                 END
-                WHERE id=@producto_id AND sucursal_id=@sucursal_id AND sector=@sector;
+                WHERE id=@producto_id AND sucursal_id=@sucursal_id;
             """, con, tx);
             stockCmd.Parameters.AddWithValue("@unidades", unidades);
             stockCmd.Parameters.AddWithValue("@producto_id", req.ProductoId);
             stockCmd.Parameters.AddWithValue("@sucursal_id", sucursalId);
-            stockCmd.Parameters.AddWithValue("@sector", sectorReporte);
             await stockCmd.ExecuteNonQueryAsync();
         }
 
@@ -2385,14 +2379,12 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
                 SELECT id
                 FROM productos
                 WHERE sucursal_id = @sucursal_id
-                  AND sector = @sector
                   AND LOWER(TRIM(nombre)) = LOWER(TRIM(@nombre))
                 ORDER BY id
                 LIMIT 1;
             """, con, tx))
             {
                 findProd.Parameters.AddWithValue("@sucursal_id", venta.SucursalId);
-                findProd.Parameters.AddWithValue("@sector", sectorDetalle);
                 findProd.Parameters.AddWithValue("@nombre", nombreProducto);
                 var found = await findProd.ExecuteScalarAsync();
                 if (found != null)
@@ -2414,7 +2406,7 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
                         SELECT LAST_INSERT_ID();
                     """, con, tx);
                     insertProd.Parameters.AddWithValue("@sucursal_id", venta.SucursalId);
-                    insertProd.Parameters.AddWithValue("@sector", sectorDetalle);
+                    insertProd.Parameters.AddWithValue("@sector", NormalizarSectorProducto(venta.SucursalId));
                     insertProd.Parameters.AddWithValue("@nombre", nombreProducto);
                     insertProd.Parameters.AddWithValue("@categoria", categoriaNueva);
                     productoId = Convert.ToInt64(await insertProd.ExecuteScalarAsync());
@@ -4879,10 +4871,90 @@ static string NormalizarSector(int sucursalId, string? sector, string? cajaNombr
     return "ARRIBA";
 }
 
+static string NormalizarSectorProducto(int sucursalId) => "GENERAL";
+
+static async Task EnsurePremiumSharedCatalogAsync(MySqlConnection con)
+{
+    // V70: migración UNA sola vez. Dos cajas de PREMIU comparten el mismo producto físico.
+    // Si existían copias ARRIBA/ABAJO, NO se suman los stocks para evitar inflación;
+    // se conserva la mayor cantidad observada y una sola ficha activa por nombre.
+    await using (var create = new MySqlCommand("""
+        CREATE TABLE IF NOT EXISTS migraciones_sistema (
+            clave VARCHAR(120) PRIMARY KEY,
+            aplicado_en TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+    """, con)) await create.ExecuteNonQueryAsync();
+
+    await using (var check = new MySqlCommand("SELECT COUNT(*) FROM migraciones_sistema WHERE clave='PREMIU_CATALOGO_COMPARTIDO_V70';", con))
+    {
+        if (Convert.ToInt32(await check.ExecuteScalarAsync() ?? 0) > 0) return;
+    }
+
+    await using var tx = await con.BeginTransactionAsync();
+    try
+    {
+        var rows = new List<(long id, string nombre, decimal stock, decimal minimo, string estado)>();
+        await using (var cmd = new MySqlCommand("SELECT id,nombre,stock_actual,stock_minimo,estado FROM productos WHERE sucursal_id=2 ORDER BY id FOR UPDATE;", con, tx))
+        await using (var rd = await cmd.ExecuteReaderAsync())
+        {
+            while (await rd.ReadAsync())
+                rows.Add((rd.GetInt64(0), rd.IsDBNull(1) ? "" : rd.GetString(1), rd.IsDBNull(2) ? 0m : rd.GetDecimal(2), rd.IsDBNull(3) ? 0m : rd.GetDecimal(3), rd.IsDBNull(4) ? "ACTIVO" : rd.GetString(4)));
+        }
+
+        foreach (var g in rows.GroupBy(x => (x.nombre ?? "").Trim().ToUpperInvariant()).Where(g => !string.IsNullOrWhiteSpace(g.Key)))
+        {
+            var list = g.OrderBy(x => x.id).ToList();
+            long canonicalId = list.FirstOrDefault(x => x.estado.Equals("ACTIVO", StringComparison.OrdinalIgnoreCase)).id;
+            if (canonicalId <= 0) canonicalId = list[0].id;
+            decimal stock = list.Max(x => Math.Max(0m, x.stock));
+            decimal minimo = list.Max(x => Math.Max(0m, x.minimo));
+
+            await using (var up = new MySqlCommand("UPDATE productos SET sector='GENERAL', stock_actual=@stock, stock_minimo=@minimo, estado='ACTIVO' WHERE id=@id;", con, tx))
+            {
+                up.Parameters.AddWithValue("@stock", stock);
+                up.Parameters.AddWithValue("@minimo", minimo);
+                up.Parameters.AddWithValue("@id", canonicalId);
+                await up.ExecuteNonQueryAsync();
+            }
+
+            foreach (var duplicate in list.Where(x => x.id != canonicalId))
+            {
+                await using (var copy = new MySqlCommand("""
+                    INSERT INTO presentaciones (producto_id,nombre,cantidad_base,precio_venta,estado)
+                    SELECT @canonical, p.nombre, p.cantidad_base, p.precio_venta, p.estado
+                    FROM presentaciones p
+                    WHERE p.producto_id=@duplicate
+                      AND NOT EXISTS (SELECT 1 FROM presentaciones c WHERE c.producto_id=@canonical AND LOWER(TRIM(c.nombre))=LOWER(TRIM(p.nombre)));
+                """, con, tx))
+                {
+                    copy.Parameters.AddWithValue("@canonical", canonicalId);
+                    copy.Parameters.AddWithValue("@duplicate", duplicate.id);
+                    await copy.ExecuteNonQueryAsync();
+                }
+
+                await using var off = new MySqlCommand("UPDATE productos SET sector='GENERAL', estado='INACTIVO' WHERE id=@id;", con, tx);
+                off.Parameters.AddWithValue("@id", duplicate.id);
+                await off.ExecuteNonQueryAsync();
+            }
+        }
+
+        await using (var allGeneral = new MySqlCommand("UPDATE productos SET sector='GENERAL' WHERE sucursal_id=2;", con, tx))
+            await allGeneral.ExecuteNonQueryAsync();
+        await using (var mark = new MySqlCommand("INSERT INTO migraciones_sistema(clave) VALUES('PREMIU_CATALOGO_COMPARTIDO_V70');", con, tx))
+            await mark.ExecuteNonQueryAsync();
+        await tx.CommitAsync();
+    }
+    catch
+    {
+        await tx.RollbackAsync();
+        throw;
+    }
+}
+
 static async Task EnsureSectorLayoutAsync(MySqlConnection con)
 {
-    // V62: sector independiente para EL BRUJO PREMIU. No duplica inventario existente:
-    // el catálogo histórico de PREMIU queda en ARRIBA y ABAJO comienza vacío hasta que el admin lo cargue.
+    // V70: ARRIBA/ABAJO identifica cajas/usuarios y movimientos comerciales.
+    // El catálogo e inventario físico se comparte por sucursal y usa sector GENERAL.
     string[] alters =
     {
         "ALTER TABLE usuarios ADD COLUMN sector VARCHAR(20) NOT NULL DEFAULT 'GENERAL';",
@@ -4898,12 +4970,11 @@ static async Task EnsureSectorLayoutAsync(MySqlConnection con)
         try { await new MySqlCommand(sql, con).ExecuteNonQueryAsync(); } catch { }
     }
 
-    // Permitir el mismo nombre de producto en ARRIBA y ABAJO sin borrar ningún registro histórico.
+    // Índice legado por sector se conserva por compatibilidad; V70 opera productos como catálogo compartido.
     try { await new MySqlCommand("ALTER TABLE productos DROP INDEX uk_productos_sucursal_nombre;", con).ExecuteNonQueryAsync(); } catch { }
     try { await new MySqlCommand("CREATE INDEX ix_productos_sucursal_sector_nombre ON productos(sucursal_id, sector, nombre);", con).ExecuteNonQueryAsync(); } catch { }
 
-    await new MySqlCommand("UPDATE productos SET sector='GENERAL' WHERE sucursal_id=1;", con).ExecuteNonQueryAsync();
-    await new MySqlCommand("UPDATE productos SET sector='ARRIBA' WHERE sucursal_id=2 AND (sector IS NULL OR TRIM(sector)='' OR UPPER(sector)='GENERAL');", con).ExecuteNonQueryAsync();
+    await new MySqlCommand("UPDATE productos SET sector='GENERAL' WHERE sucursal_id IN (1,2);", con).ExecuteNonQueryAsync();
     await new MySqlCommand("UPDATE usuarios SET sector='GENERAL' WHERE sucursal_id=1;", con).ExecuteNonQueryAsync();
     await new MySqlCommand("UPDATE usuarios SET sector=CASE WHEN UPPER(COALESCE(caja_nombre,'')) LIKE '%ABAJO%' OR UPPER(COALESCE(caja_nombre,''))='CAJA 2' THEN 'ABAJO' ELSE 'ARRIBA' END WHERE sucursal_id=2 AND (sector IS NULL OR TRIM(sector)='' OR UPPER(sector)='GENERAL');", con).ExecuteNonQueryAsync();
     try { await new MySqlCommand("UPDATE detalle_ventas d INNER JOIN productos p ON p.id=d.producto_id SET d.sector=p.sector WHERE d.sector IS NULL OR TRIM(d.sector)='' OR (UPPER(d.sector)='GENERAL' AND p.sucursal_id=2);", con).ExecuteNonQueryAsync(); } catch { }
@@ -6273,7 +6344,7 @@ public record UserEstadoRequest(string Estado);
 
 // V66: inventario real para combos/promociones.
 // Los combos no usan un stock ficticio propio: descuentan los productos físicos disponibles
-// en la misma sucursal y sector. Las sodas se toman del catálogo activo (Coca-Cola/Fanta/Sprite).
+// en la misma sucursal. ARRIBA/ABAJO comparten stock; las sodas se toman del catálogo activo (Coca-Cola/Fanta/Sprite).
 public static class CompositeInventoryDb
 {
     public sealed class StockProduct
@@ -6341,12 +6412,11 @@ public static class CompositeInventoryDb
         string sql = """
             SELECT id, nombre, categoria, stock_actual, COALESCE(sin_limite_stock,0) AS sin_limite_stock
             FROM productos
-            WHERE sucursal_id=@sucursal_id AND sector=@sector AND estado='ACTIVO'
+            WHERE sucursal_id=@sucursal_id AND estado='ACTIVO'
             ORDER BY id
             """ + (forUpdate ? " FOR UPDATE;" : ";");
         await using var cmd = tx == null ? new MySqlCommand(sql, con) : new MySqlCommand(sql, con, tx);
         cmd.Parameters.AddWithValue("@sucursal_id", sucursalId);
-        cmd.Parameters.AddWithValue("@sector", sector);
         List<StockProduct> result = new();
         await using var rd = await cmd.ExecuteReaderAsync();
         while (await rd.ReadAsync())
@@ -6517,14 +6587,13 @@ public static class CompositeInventoryDb
             await using var upd = new MySqlCommand("""
                 UPDATE productos
                 SET stock_actual = stock_actual - @units
-                WHERE id=@id AND sucursal_id=@sucursal_id AND sector=@sector
+                WHERE id=@id AND sucursal_id=@sucursal_id
                   AND estado='ACTIVO' AND COALESCE(sin_limite_stock,0)=0
                   AND stock_actual >= @units;
             """, con, tx);
             upd.Parameters.AddWithValue("@units", part.Units);
             upd.Parameters.AddWithValue("@id", part.ProductId);
             upd.Parameters.AddWithValue("@sucursal_id", sucursalId);
-            upd.Parameters.AddWithValue("@sector", sector);
             if (await upd.ExecuteNonQueryAsync() != 1)
                 return (false, "El inventario cambió mientras se registraba la venta. Actualiza el catálogo e inténtalo nuevamente.", "", parts);
         }
