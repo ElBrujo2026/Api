@@ -69,7 +69,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
         return Results.Ok(new
         {
             ok = true,
-            version = "V70_PREMIU_CATALOGO_COMPARTIDO",
+            version = "V71_ANTIINFLACION_TRAGO_DULCE",
             database,
             mysql = "conectado",
             googleSheets = sheets.IsConfigured ? "configurado" : "faltan variables GOOGLE_SHEET_ID y GOOGLE_CREDENTIALS_JSON",
@@ -87,10 +87,10 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
 app.MapGet("/api/system/version", () => Results.Ok(new
 {
     ok = true,
-    apiVersion = "V70_PREMIU_CATALOGO_COMPARTIDO",
-    minimumClientVersion = 149,
+    apiVersion = "V71_ANTIINFLACION_TRAGO_DULCE",
+    minimumClientVersion = 151,
     accountingMode = "LIBRO_INMUTABLE_TRANSACCIONAL",
-    message = "Caja/Admin V149 compatible. EL BRUJO PREMIU usa un solo catálogo/inventario compartido entre ARRIBA y ABAJO; las cajas, turnos y reportes siguen separados. Mantiene inventario delta idempotente, pago parcial seguro y contabilidad anti duplicado."
+    message = "Caja/Admin V151 compatible. Mantiene ventas idempotentes, inventario delta seguro, catálogo compartido de PREMIU y TRAGO DULCE dentro de Tragos / Botellas."
 }));
 
 app.MapGet("/api/sheets/status", (SheetsReporter sheets) =>
@@ -2073,8 +2073,8 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
     {
         // V45: bloqueo de cajas antiguas. Evita que una versión sin OperationKey/cola offline
         // vuelva a inflar ventas o stock.
-        if (!venta.ClientVersion.HasValue || venta.ClientVersion.Value < 140)
-            return Results.Json(new { ok = false, message = "Caja desactualizada. Se requiere Caja V140 o superior para registrar cobros en Railway.", minimumClientVersion = 140 }, statusCode: StatusCodes.Status426UpgradeRequired);
+        if (!venta.ClientVersion.HasValue || venta.ClientVersion.Value < 151)
+            return Results.Json(new { ok = false, message = "Caja desactualizada. Se requiere Caja V151 o superior para registrar cobros en Railway.", minimumClientVersion = 151 }, statusCode: StatusCodes.Status426UpgradeRequired);
 
         string syncKey = string.IsNullOrWhiteSpace(venta.SyncKey)
             ? Guid.NewGuid().ToString("N")
@@ -2086,7 +2086,7 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
         // V47: toda Caja V128+ debe traer las dos identidades. Si falta una, NO se inventa
         // una nueva en el servidor, porque eso podría transformar un reintento en otra venta.
         if (string.IsNullOrWhiteSpace(venta.SyncKey) || string.IsNullOrWhiteSpace(operationKey))
-            return Results.BadRequest(new { ok = false, message = "El cobro llegó sin SyncKey u OperationKey. Se bloqueó para evitar duplicación.", minimumClientVersion = 140 });
+            return Results.BadRequest(new { ok = false, message = "El cobro llegó sin SyncKey u OperationKey. Se bloqueó para evitar duplicación.", minimumClientVersion = 151 });
 
         // V54: candados de servidor. Serializan reintentos simultáneos aunque una base histórica
         // todavía no haya podido crear todos los índices UNIQUE por duplicados antiguos.
@@ -2244,9 +2244,9 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
                 .Select(d => (d.ConsumptionKey ?? "").Trim())
                 .ToList();
             if (partialKeys.Any(string.IsNullOrWhiteSpace))
-                return Results.BadRequest(new { ok = false, message = "Un pago parcial llegó con productos sin ConsumptionKey. Se bloqueó para evitar doble cobro.", minimumClientVersion = 140 });
+                return Results.BadRequest(new { ok = false, message = "Un pago parcial llegó con productos sin ConsumptionKey. Se bloqueó para evitar doble cobro.", minimumClientVersion = 151 });
             if (partialKeys.Distinct(StringComparer.OrdinalIgnoreCase).Count() != partialKeys.Count)
-                return Results.BadRequest(new { ok = false, message = "El mismo producto aparece repetido dentro del pago parcial. Se bloqueó para evitar inflación.", minimumClientVersion = 140 });
+                return Results.BadRequest(new { ok = false, message = "El mismo producto aparece repetido dentro del pago parcial. Se bloqueó para evitar inflación.", minimumClientVersion = 151 });
         }
 
         // V48: un cierre final de sesión se contabiliza una sola vez, aunque llegue con otra OperationKey.
@@ -5003,8 +5003,9 @@ static string NormalizarCategoriaProducto(string? categoria, string? nombre)
     if (c.Contains("CERVEZA") || c == "CERVEZAS" || n.StartsWith("CERVEZA ") || n.Contains("PACEÑA") || n.Contains("CONTI") || n.Contains("CORONA") || n.Contains("SKOL") || n.Contains("SKUL") || n.Contains("AMSTEL")) return "Cervezas";
     if (c.Contains("CIGARRO") || n.Contains("CIGARRO") || n.Contains("CAMEL") || n.Contains("BOHEM") || n.Contains("BOHEN") || n.Contains("HILLS")) return "Cigarros";
     if (c.Contains("SNACK") || c.Contains("PIQUEO") || n.Contains("NACHO") || n.Contains("PAPA") || n.Contains("PIZON") || n.Contains("PINZON") || n.Contains("PLATANITO") || n.Contains("TAKIS") || n.Contains("MIX NAX")) return "Snacks y piqueos";
+    // V71: TRAGO DULCE se mantiene en Tragos / Botellas; TRAGO tiene prioridad sobre DULCE.
+    if (c.Contains("TRAGO") || c.Contains("BOTELLA") || n.Contains("TRAGO DULCE") || n.StartsWith("TRAGO ") || n.Contains("RON") || n.Contains("FERNET") || n.Contains("GIN") || n.Contains("TEQUILA") || n.Contains("WHIKY") || n.Contains("WHISK") || n.Contains("WISK") || n.Contains("VINO") || n.Contains("AMARULA") || n.Contains("FLOR DE CAÑA") || n.Contains("FOUR LOCO") || n.Contains("FLOW") || n.Contains("HAVANA") || n.Contains("HABANA") || n.Contains("ICE 51") || n.Contains("NOCHE ICE") || n.Contains("OLD")) return "Tragos / Botellas";
     if (c.Contains("DULCE") || c.Contains("GOLOSINA") || n.Contains("CHICLE") || n.Contains("CLORETS") || n.Contains("BELDEN") || n.Contains("ARCOR") || n.Contains("HALLS") || n.Contains("MABEL") || n.Contains("GROSO") || n.Contains("MINT") || n.Contains("CHUPETE") || n.Contains("EUCALIPTO") || n.Contains("BICO SABORES")) return "Dulces y golosinas";
-    if (c.Contains("TRAGO") || c.Contains("BOTELLA") || n.Contains("RON") || n.Contains("FERNET") || n.Contains("GIN") || n.Contains("TEQUILA") || n.Contains("WHIKY") || n.Contains("WHISK") || n.Contains("WISK") || n.Contains("VINO") || n.Contains("AMARULA") || n.Contains("FLOR DE CAÑA") || n.Contains("FOUR LOCO") || n.Contains("FLOW") || n.Contains("HAVANA") || n.Contains("HABANA") || n.Contains("ICE 51") || n.Contains("NOCHE ICE") || n.Contains("OLD")) return "Tragos / Botellas";
     return "Otros";
 }
 
