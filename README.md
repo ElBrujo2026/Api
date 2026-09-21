@@ -1,13 +1,18 @@
-# BILLAR EL BRUJO API V64
+# BILLAR EL BRUJO API V73
 
-## Sectores + Excel online + usuarios reales EL BRUJO
-- EL BRUJO: sector GENERAL.
-- EL BRUJO PREMIU: ARRIBA y ABAJO con catálogo/stock independiente.
-- EL BRUJO usa los usuarios: `brujo1` (MAÑANA) y `brujo2` (NOCHE).
-- EL BRUJO PREMIU conserva sus 4 cajeros sin cambios.
-- Google Sheets publica ventas, cierres, productos, inventario y comisiones por sucursal.
-- `/api/sheets/debug` permite comprobar cuántas filas existen realmente en Railway.
-- `/api/sheets/sync` fuerza la publicación a Google Sheets.
-- Mantiene ventas canónicas, OperationKey, SyncKey y ConsumptionKey para evitar inflación por reintentos.
+API central para Caja/Admin V157 y App Mesera V18.
 
-Compatible con Caja/Admin V143 y App Mesera V18.
+## Google Sheets
+- Conexión real verificable con `/api/sheets/test`.
+- Diagnóstico completo con `/api/sheets/debug`.
+- Sincronización manual con `/api/sheets/sync`.
+- Reportes separados para EL BRUJO y EL BRUJO PREMIU.
+- Incluye `*_DETALLE_VENTAS` sin duplicar totales.
+- Premium mantiene un único catálogo/inventario compartido entre caja ARRIBA y ABAJO.
+
+## Variables Railway
+- `GOOGLE_SHEET_ID`
+- `GOOGLE_CREDENTIALS_JSON`
+- opcional: `GOOGLE_CREDENTIALS_JSON_BASE64`
+
+El archivo de Google Sheets debe compartirse como **Editor** con el `client_email` de la cuenta de servicio.

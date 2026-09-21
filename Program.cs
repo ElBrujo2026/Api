@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using System.Security.Cryptography;
 using Google.Apis.Auth.OAuth2;
 using Google.Apis.Services;
@@ -39,6 +40,11 @@ try
     await EnsureTablePricingAsync(startupCon);
     await EnsureVentaSyncProtection(startupCon);
     await EnsureAccountingLedger(startupCon);
+    try { await new MySqlCommand("ALTER TABLE cobros_mesa ADD COLUMN caja_nombre VARCHAR(100) NOT NULL DEFAULT '' AFTER mesa;", startupCon).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE cobros_mesa ADD COLUMN sector VARCHAR(20) NOT NULL DEFAULT 'GENERAL' AFTER caja_nombre;", startupCon).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE cobros_mesa DROP INDEX uk_cobro_sesion;", startupCon).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("UPDATE cobros_mesa SET sector=CASE WHEN sucursal_id=1 THEN 'GENERAL' WHEN UPPER(COALESCE(caja_nombre,'')) LIKE '%ABAJO%' THEN 'ABAJO' ELSE 'ARRIBA' END WHERE sector IS NULL OR TRIM(sector)='' OR (sucursal_id=2 AND UPPER(sector)='GENERAL');", startupCon).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE cobros_mesa ADD UNIQUE KEY uk_cobro_sesion_sector (sucursal_id, sector, session_id);", startupCon).ExecuteNonQueryAsync(); } catch { }
     // V66: los productos servidos en vaso también manejan cantidad real y deben descontarse.
     await using (var vasoStock = new MySqlCommand("UPDATE productos SET sin_limite_stock=0 WHERE categoria='Servidos en vaso';", startupCon))
         await vasoStock.ExecuteNonQueryAsync();
@@ -69,7 +75,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
         return Results.Ok(new
         {
             ok = true,
-            version = "V71_ANTIINFLACION_TRAGO_DULCE",
+            version = "V74_PREMIU_MESAS_SECTOR_CAJA",
             database,
             mysql = "conectado",
             googleSheets = sheets.IsConfigured ? "configurado" : "faltan variables GOOGLE_SHEET_ID y GOOGLE_CREDENTIALS_JSON",
@@ -87,28 +93,31 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
 app.MapGet("/api/system/version", () => Results.Ok(new
 {
     ok = true,
-    apiVersion = "V71_ANTIINFLACION_TRAGO_DULCE",
-    minimumClientVersion = 151,
+    apiVersion = "V74_PREMIU_MESAS_SECTOR_CAJA",
+    minimumClientVersion = 158,
     accountingMode = "LIBRO_INMUTABLE_TRANSACCIONAL",
-    message = "Caja/Admin V151 compatible. Mantiene ventas idempotentes, inventario delta seguro, catálogo compartido de PREMIU y TRAGO DULCE dentro de Tragos / Botellas."
+    message = "Caja/Admin V158 o superior. PREMIU separa mesas ARRIBA/ABAJO y cobros por caja/sector sin dividir inventario."
 }));
 
-app.MapGet("/api/sheets/status", (SheetsReporter sheets) =>
+app.MapGet("/api/sheets/status", async (SheetsReporter sheets) =>
 {
-    return Results.Ok(new
-    {
-        configured = sheets.IsConfigured,
-        spreadsheetId = sheets.SpreadsheetId,
-        message = sheets.IsConfigured
-            ? "Google Sheets configurado en Railway"
-            : "Faltan GOOGLE_SHEET_ID y GOOGLE_CREDENTIALS_JSON en Variables de Railway"
-    });
+    var test = await sheets.TestConnectionAsync();
+    return Results.Ok(test);
+});
+
+// V73: prueba REAL contra Google. No basta con que existan las variables de Railway.
+// Este endpoint confirma ID, credencial, correo de la cuenta de servicio y permiso sobre el Sheet.
+app.MapGet("/api/sheets/test", async (SheetsReporter sheets) =>
+{
+    var test = await sheets.TestConnectionAsync();
+    return test.Ok ? Results.Ok(test) : Results.Json(test, statusCode: StatusCodes.Status503ServiceUnavailable);
 });
 
 app.MapGet("/api/sheets/debug", async (Db db, SheetsReporter sheets) =>
 {
     try
     {
+        var sheetsConnection = await sheets.TestConnectionAsync();
         await using var con = await db.OpenAsync();
         await EnsureCoreSchemaAsync(con);
         await EnsureUserManagementTables(con);
@@ -133,8 +142,12 @@ app.MapGet("/api/sheets/debug", async (Db db, SheetsReporter sheets) =>
         return Results.Ok(new
         {
             ok = true,
-            apiVersion = "V70_PREMIU_CATALOGO_COMPARTIDO",
+            apiVersion = "V74_PREMIU_MESAS_SECTOR_CAJA",
             googleSheetsConfigured = sheets.IsConfigured,
+            googleSheetsConnected = sheetsConnection.Ok,
+            googleSheetsMessage = sheetsConnection.Message,
+            serviceAccountEmail = sheetsConnection.ServiceAccountEmail,
+            spreadsheetTitle = sheetsConnection.SpreadsheetTitle,
             spreadsheetId = sheets.SpreadsheetId,
             ventasRaw,
             ventasCanonicas,
@@ -165,8 +178,12 @@ app.MapPost("/api/sheets/sync", async (Db db, SheetsReporter sheets) =>
             await EnsureVentaSyncProtection(con);
             await EnsureAccountingLedger(con);
         }
+        var connection = await sheets.TestConnectionAsync();
+        if (!connection.Ok)
+            return Results.Json(connection, statusCode: StatusCodes.Status503ServiceUnavailable);
+
         var result = await sheets.SyncFromDatabaseAsync(db);
-        return Results.Ok(new { ok = true, message = result });
+        return Results.Ok(new { ok = true, connection, message = result });
     }
     catch (Exception ex)
     {
@@ -189,8 +206,12 @@ app.MapGet("/api/sheets/sync", async (Db db, SheetsReporter sheets) =>
             await EnsureVentaSyncProtection(con);
             await EnsureAccountingLedger(con);
         }
+        var connection = await sheets.TestConnectionAsync();
+        if (!connection.Ok)
+            return Results.Json(connection, statusCode: StatusCodes.Status503ServiceUnavailable);
+
         var result = await sheets.SyncFromDatabaseAsync(db);
-        return Results.Ok(new { ok = true, message = result });
+        return Results.Ok(new { ok = true, connection, message = result });
     }
     catch (Exception ex)
     {
@@ -896,34 +917,53 @@ app.MapPost("/api/app-mesera/login", async (Db db, LoginRequest req) =>
     });
 });
 
-app.MapGet("/api/app-mesera/mesas", async (Db db, int sucursalId) =>
+app.MapGet("/api/app-mesera/mesas", async (Db db, int sucursalId, string? usuario, string? sector) =>
 {
     await using var con = await db.OpenAsync();
     await EnsureAppMeseraTables(con);
     await EnsureMesasEnVivoTables(con);
-    await EnsureOfficialBranchAndTableLayout(con);
 
+    int sid = sucursalId == 2 ? 2 : 1;
+    string sectorEfectivo = NormalizarSector(sid, sector);
+    if (!string.IsNullOrWhiteSpace(usuario))
+    {
+        await using var sectorCmd = new MySqlCommand("SELECT sucursal_id, sector FROM usuarios WHERE usuario=@usuario AND estado='ACTIVO' LIMIT 1;", con);
+        sectorCmd.Parameters.AddWithValue("@usuario", usuario.Trim().ToLowerInvariant());
+        await using var rd = await sectorCmd.ExecuteReaderAsync();
+        if (!await rd.ReadAsync()) return Results.Unauthorized();
+        int usuarioSucursal = rd.GetInt32(0);
+        if (usuarioSucursal != sid) return Results.BadRequest(new { ok=false, message="El usuario no pertenece a esta sucursal." });
+        sectorEfectivo = NormalizarSector(sid, rd.IsDBNull(1) ? null : rd.GetString(1));
+    }
+
+    int limite = sid == 1 ? 8 : (sectorEfectivo == "ABAJO" ? 10 : 5);
     const string sql = """
-        SELECT m.id AS mesa_id,
-               m.nombre AS mesa,
-               COALESCE(me.estado, m.estado, 'LIBRE') AS estado,
+        WITH RECURSIVE nums AS (
+            SELECT 1 AS n
+            UNION ALL
+            SELECT n + 1 FROM nums WHERE n < @limite
+        )
+        SELECT nums.n AS mesa_id,
+               CONCAT('Mesa ', nums.n) AS mesa,
+               COALESCE(me.estado, 'LIBRE') AS estado,
                COALESCE(me.total_consumo, 0) AS total_consumo,
                me.fin_programado,
-               me.cajero
-        FROM mesas m
+               me.cajero,
+               @sector AS sector
+        FROM nums
         LEFT JOIN mesa_estados me
-            ON me.sucursal_id = m.sucursal_id AND me.mesa_id = m.id
-        WHERE m.sucursal_id = @sucursalId
-          AND m.estado <> 'INACTIVA'
-        ORDER BY m.id;
+          ON me.sucursal_id=@sucursalId
+         AND me.sector=@sector
+         AND me.mesa_id=nums.n
+        ORDER BY nums.n;
     """;
 
-    var rows = await db.QueryAsync(con, sql, new Dictionary<string, object?>
+    return Results.Ok(await db.QueryAsync(con, sql, new Dictionary<string, object?>
     {
-        ["@sucursalId"] = sucursalId
-    });
-
-    return Results.Ok(rows);
+        ["@sucursalId"] = sid,
+        ["@sector"] = sectorEfectivo,
+        ["@limite"] = limite
+    }));
 });
 
 app.MapGet("/api/app-mesera/productos", async (Db db, int sucursalId, string? usuario, string? sector) =>
@@ -1074,6 +1114,7 @@ app.MapPost("/api/app-mesera/pedidos", async (Db db, AppPedidoMovilRequest req) 
         SELECT estado
         FROM mesa_estados
         WHERE sucursal_id = @sucursal_id
+          AND sector = @sector
           AND mesa_id = @mesa_id
         LIMIT 1;
     """;
@@ -1081,6 +1122,7 @@ app.MapPost("/api/app-mesera/pedidos", async (Db db, AppPedidoMovilRequest req) 
     await using (var mesaCmd = new MySqlCommand(mesaActivaSql, con))
     {
         mesaCmd.Parameters.AddWithValue("@sucursal_id", req.SucursalId);
+        mesaCmd.Parameters.AddWithValue("@sector", sectorPedido);
         mesaCmd.Parameters.AddWithValue("@mesa_id", req.MesaId);
         string estadoMesa = Convert.ToString(await mesaCmd.ExecuteScalarAsync()) ?? "";
 
@@ -2074,7 +2116,7 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
         // V45: bloqueo de cajas antiguas. Evita que una versión sin OperationKey/cola offline
         // vuelva a inflar ventas o stock.
         if (!venta.ClientVersion.HasValue || venta.ClientVersion.Value < 151)
-            return Results.Json(new { ok = false, message = "Caja desactualizada. Se requiere Caja V151 o superior para registrar cobros en Railway.", minimumClientVersion = 151 }, statusCode: StatusCodes.Status426UpgradeRequired);
+            return Results.Json(new { ok = false, message = "Caja desactualizada. Se requiere Caja V158 o superior para registrar cobros en Railway.", minimumClientVersion = 158 }, statusCode: StatusCodes.Status426UpgradeRequired);
 
         string syncKey = string.IsNullOrWhiteSpace(venta.SyncKey)
             ? Guid.NewGuid().ToString("N")
@@ -2086,7 +2128,7 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
         // V47: toda Caja V128+ debe traer las dos identidades. Si falta una, NO se inventa
         // una nueva en el servidor, porque eso podría transformar un reintento en otra venta.
         if (string.IsNullOrWhiteSpace(venta.SyncKey) || string.IsNullOrWhiteSpace(operationKey))
-            return Results.BadRequest(new { ok = false, message = "El cobro llegó sin SyncKey u OperationKey. Se bloqueó para evitar duplicación.", minimumClientVersion = 151 });
+            return Results.BadRequest(new { ok = false, message = "El cobro llegó sin SyncKey u OperationKey. Se bloqueó para evitar duplicación.", minimumClientVersion = 158 });
 
         // V54: candados de servidor. Serializan reintentos simultáneos aunque una base histórica
         // todavía no haya podido crear todos los índices UNIQUE por duplicados antiguos.
@@ -2244,9 +2286,9 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
                 .Select(d => (d.ConsumptionKey ?? "").Trim())
                 .ToList();
             if (partialKeys.Any(string.IsNullOrWhiteSpace))
-                return Results.BadRequest(new { ok = false, message = "Un pago parcial llegó con productos sin ConsumptionKey. Se bloqueó para evitar doble cobro.", minimumClientVersion = 151 });
+                return Results.BadRequest(new { ok = false, message = "Un pago parcial llegó con productos sin ConsumptionKey. Se bloqueó para evitar doble cobro.", minimumClientVersion = 158 });
             if (partialKeys.Distinct(StringComparer.OrdinalIgnoreCase).Count() != partialKeys.Count)
-                return Results.BadRequest(new { ok = false, message = "El mismo producto aparece repetido dentro del pago parcial. Se bloqueó para evitar inflación.", minimumClientVersion = 151 });
+                return Results.BadRequest(new { ok = false, message = "El mismo producto aparece repetido dentro del pago parcial. Se bloqueó para evitar inflación.", minimumClientVersion = 158 });
         }
 
         // V48: un cierre final de sesión se contabiliza una sola vez, aunque llegue con otra OperationKey.
@@ -2255,11 +2297,15 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
             await using var finalCmd = new MySqlCommand("""
                 SELECT id, sync_key, COALESCE(operation_key,'')
                 FROM ventas
-                WHERE sucursal_id = @sucursal_id AND session_id = @session_id AND UPPER(TRIM(tipo)) = 'MESA'
+                WHERE sucursal_id = @sucursal_id
+                  AND session_id = @session_id
+                  AND UPPER(TRIM(tipo)) = 'MESA'
+                  AND UPPER(TRIM(COALESCE(caja_nombre,''))) = UPPER(TRIM(@caja_nombre))
                 ORDER BY id LIMIT 1;
             """, con, tx);
             finalCmd.Parameters.AddWithValue("@sucursal_id", venta.SucursalId);
             finalCmd.Parameters.AddWithValue("@session_id", venta.SessionId.Value);
+            finalCmd.Parameters.AddWithValue("@caja_nombre", venta.CajaNombre ?? "");
             await using var finalRd = await finalCmd.ExecuteReaderAsync();
             if (await finalRd.ReadAsync())
             {
@@ -2681,6 +2727,8 @@ app.MapPost("/api/cobros-mesa", async (Db db, SheetsReporter sheets, CobroMesaRe
             session_id INT NULL,
             mesa_id INT NULL,
             mesa VARCHAR(100) NOT NULL,
+            caja_nombre VARCHAR(100) NOT NULL DEFAULT '',
+            sector VARCHAR(20) NOT NULL DEFAULT 'GENERAL',
             cajero VARCHAR(100) NOT NULL,
             mesera VARCHAR(150) NULL,
             fecha DATETIME NOT NULL,
@@ -2690,7 +2738,7 @@ app.MapPost("/api/cobros-mesa", async (Db db, SheetsReporter sheets, CobroMesaRe
             total_cobrado DECIMAL(10,2) NOT NULL DEFAULT 0,
             metodo_pago VARCHAR(50) NOT NULL,
             sync_key VARCHAR(180) NOT NULL UNIQUE,
-            UNIQUE KEY uk_cobro_sesion (sucursal_id, session_id)
+            UNIQUE KEY uk_cobro_sesion_sector (sucursal_id, sector, session_id)
         );
     """, con))
     {
@@ -2698,7 +2746,7 @@ app.MapPost("/api/cobros-mesa", async (Db db, SheetsReporter sheets, CobroMesaRe
     }
 
     // V49: una sesión solo puede tener un cobro de mesa confirmado.
-    try { await new MySqlCommand("ALTER TABLE cobros_mesa ADD UNIQUE KEY uk_cobro_sesion (sucursal_id, session_id);", con).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE cobros_mesa ADD UNIQUE KEY uk_cobro_sesion_sector (sucursal_id, sector, session_id);", con).ExecuteNonQueryAsync(); } catch { }
 
     // V37: el detalle de tiempo ahora incluye modalidad, tiempo real, horas cobradas y tarifa.
     try
@@ -2709,6 +2757,7 @@ app.MapPost("/api/cobros-mesa", async (Db db, SheetsReporter sheets, CobroMesaRe
     catch { }
 
     string syncKey = string.IsNullOrWhiteSpace(c.SyncKey) ? Guid.NewGuid().ToString("N") : c.SyncKey;
+    string cobroSector = NormalizarSector(c.SucursalId, c.Sector, c.CajaNombre);
 
     // V49: aunque otra PC o un reintento cambie sync_key, la misma SessionId no puede cobrarse dos veces.
     if (c.SessionId.HasValue && c.SessionId.Value > 0)
@@ -2716,10 +2765,11 @@ app.MapPost("/api/cobros-mesa", async (Db db, SheetsReporter sheets, CobroMesaRe
         await using var sameSession = new MySqlCommand("""
             SELECT id, COALESCE(mesa_id,0), total_mesa, total_consumo, total_cobrado, metodo_pago, sync_key
             FROM cobros_mesa
-            WHERE sucursal_id=@sucursal_id AND session_id=@session_id
+            WHERE sucursal_id=@sucursal_id AND sector=@sector AND session_id=@session_id
             ORDER BY id LIMIT 1;
         """, con);
         sameSession.Parameters.AddWithValue("@sucursal_id", c.SucursalId);
+        sameSession.Parameters.AddWithValue("@sector", cobroSector);
         sameSession.Parameters.AddWithValue("@session_id", c.SessionId.Value);
         await using var rdSession = await sameSession.ExecuteReaderAsync();
         if (await rdSession.ReadAsync())
@@ -2770,9 +2820,9 @@ app.MapPost("/api/cobros-mesa", async (Db db, SheetsReporter sheets, CobroMesaRe
 
     const string sql = """
         INSERT INTO cobros_mesa
-        (sucursal_id, session_id, mesa_id, mesa, cajero, mesera, fecha, tiempo, total_mesa, total_consumo, total_cobrado, metodo_pago, sync_key)
+        (sucursal_id, session_id, mesa_id, mesa, caja_nombre, sector, cajero, mesera, fecha, tiempo, total_mesa, total_consumo, total_cobrado, metodo_pago, sync_key)
         VALUES
-        (@sucursal_id, @session_id, @mesa_id, @mesa, @cajero, @mesera, @fecha, @tiempo, @total_mesa, @total_consumo, @total_cobrado, @metodo_pago, @sync_key)
+        (@sucursal_id, @session_id, @mesa_id, @mesa, @caja_nombre, @sector, @cajero, @mesera, @fecha, @tiempo, @total_mesa, @total_consumo, @total_cobrado, @metodo_pago, @sync_key)
         ON DUPLICATE KEY UPDATE
             sync_key = VALUES(sync_key);
     """;
@@ -2782,6 +2832,8 @@ app.MapPost("/api/cobros-mesa", async (Db db, SheetsReporter sheets, CobroMesaRe
     cmd.Parameters.AddWithValue("@session_id", c.SessionId.HasValue ? c.SessionId.Value : DBNull.Value);
     cmd.Parameters.AddWithValue("@mesa_id", c.MesaId.HasValue ? c.MesaId.Value : DBNull.Value);
     cmd.Parameters.AddWithValue("@mesa", c.Mesa ?? "");
+    cmd.Parameters.AddWithValue("@caja_nombre", c.CajaNombre ?? "");
+    cmd.Parameters.AddWithValue("@sector", cobroSector);
     cmd.Parameters.AddWithValue("@cajero", c.Cajero ?? "");
     cmd.Parameters.AddWithValue("@mesera", c.Mesera ?? "");
     cmd.Parameters.AddWithValue("@fecha", c.Fecha);
@@ -2811,6 +2863,8 @@ app.MapGet("/api/cobros-mesa", async (Db db, int? sucursalId) =>
             session_id INT NULL,
             mesa_id INT NULL,
             mesa VARCHAR(100) NOT NULL,
+            caja_nombre VARCHAR(100) NOT NULL DEFAULT '',
+            sector VARCHAR(20) NOT NULL DEFAULT 'GENERAL',
             cajero VARCHAR(100) NOT NULL,
             mesera VARCHAR(150) NULL,
             fecha DATETIME NOT NULL,
@@ -2820,7 +2874,7 @@ app.MapGet("/api/cobros-mesa", async (Db db, int? sucursalId) =>
             total_cobrado DECIMAL(10,2) NOT NULL DEFAULT 0,
             metodo_pago VARCHAR(50) NOT NULL,
             sync_key VARCHAR(180) NOT NULL UNIQUE,
-            UNIQUE KEY uk_cobro_sesion (sucursal_id, session_id)
+            UNIQUE KEY uk_cobro_sesion_sector (sucursal_id, sector, session_id)
         );
     """, con))
     {
@@ -2839,7 +2893,7 @@ app.MapGet("/api/cobros-mesa", async (Db db, int? sucursalId) =>
     string sql = $"""
         SELECT c.id, c.session_id, DATE(c.fecha) AS fecha, TIME(c.fecha) AS hora,
                CASE WHEN s.id = 2 THEN 'EL BRUJO PREMIU' ELSE 'EL BRUJO' END AS sucursal,
-               c.mesa, c.cajero, c.mesera, c.tiempo,
+               c.mesa, c.caja_nombre, c.sector, c.cajero, c.mesera, c.tiempo,
                c.total_mesa, c.total_consumo, c.total_cobrado, c.metodo_pago
         FROM cobros_mesa c
         INNER JOIN sucursales s ON s.id = c.sucursal_id
@@ -2858,18 +2912,22 @@ app.MapGet("/api/cobros-mesa", async (Db db, int? sucursalId) =>
 app.MapPost("/api/mesas/estado", async (Db db, SheetsReporter sheets, MesaEstadoRequest m) =>
 {
     await using var con = await db.OpenAsync();
-
     await EnsureMesasEnVivoTables(con);
 
+    string sector = NormalizarSector(m.SucursalId, m.Sector);
+    int maxMesa = m.SucursalId == 2 ? (sector == "ABAJO" ? 10 : 5) : 8;
+    if (m.MesaId <= 0 || m.MesaId > maxMesa)
+        return Results.BadRequest(new { ok=false, message="Mesa fuera del rango oficial para esta caja/sector.", sector, mesaId=m.MesaId, maxMesa });
+
     string syncKey = string.IsNullOrWhiteSpace(m.SyncKey)
-        ? $"MESA-{m.SucursalId}-{m.MesaId}"
+        ? $"MESA-{m.SucursalId}-{sector}-{m.MesaId}"
         : m.SyncKey;
 
     const string sql = """
         INSERT INTO mesa_estados
-        (sucursal_id, mesa_id, mesa, estado, cajero, inicio, fin_programado, minutos, tarifa_hora, total_mesa, total_consumo, total_general, cliente_reserva, actualizado, sync_key)
+        (sucursal_id, sector, mesa_id, mesa, estado, cajero, inicio, fin_programado, minutos, tarifa_hora, total_mesa, total_consumo, total_general, cliente_reserva, actualizado, sync_key)
         VALUES
-        (@sucursal_id, @mesa_id, @mesa, @estado, @cajero, @inicio, @fin_programado, @minutos, @tarifa_hora, @total_mesa, @total_consumo, @total_general, @cliente_reserva, NOW(), @sync_key)
+        (@sucursal_id, @sector, @mesa_id, @mesa, @estado, @cajero, @inicio, @fin_programado, @minutos, @tarifa_hora, @total_mesa, @total_consumo, @total_general, @cliente_reserva, NOW(), @sync_key)
         ON DUPLICATE KEY UPDATE
             mesa = VALUES(mesa),
             estado = VALUES(estado),
@@ -2882,11 +2940,13 @@ app.MapPost("/api/mesas/estado", async (Db db, SheetsReporter sheets, MesaEstado
             total_consumo = VALUES(total_consumo),
             total_general = VALUES(total_general),
             cliente_reserva = VALUES(cliente_reserva),
-            actualizado = NOW();
+            actualizado = NOW(),
+            sync_key = VALUES(sync_key);
     """;
 
     await using var cmd = new MySqlCommand(sql, con);
     cmd.Parameters.AddWithValue("@sucursal_id", m.SucursalId);
+    cmd.Parameters.AddWithValue("@sector", sector);
     cmd.Parameters.AddWithValue("@mesa_id", m.MesaId);
     cmd.Parameters.AddWithValue("@mesa", m.Mesa ?? ("Mesa " + m.MesaId));
     cmd.Parameters.AddWithValue("@estado", m.Estado ?? "LIBRE");
@@ -2903,9 +2963,10 @@ app.MapPost("/api/mesas/estado", async (Db db, SheetsReporter sheets, MesaEstado
     cmd.Parameters.AddWithValue("@sync_key", syncKey);
     await cmd.ExecuteNonQueryAsync();
 
-    await using (var del = new MySqlCommand("DELETE FROM mesa_consumos_vivos WHERE sucursal_id = @sucursal_id AND mesa_id = @mesa_id;", con))
+    await using (var del = new MySqlCommand("DELETE FROM mesa_consumos_vivos WHERE sucursal_id=@sucursal_id AND sector=@sector AND mesa_id=@mesa_id;", con))
     {
         del.Parameters.AddWithValue("@sucursal_id", m.SucursalId);
+        del.Parameters.AddWithValue("@sector", sector);
         del.Parameters.AddWithValue("@mesa_id", m.MesaId);
         await del.ExecuteNonQueryAsync();
     }
@@ -2920,7 +2981,7 @@ app.MapPost("/api/mesas/estado", async (Db db, SheetsReporter sheets, MesaEstado
         """, con);
         det.Parameters.AddWithValue("@sucursal_id", m.SucursalId);
         det.Parameters.AddWithValue("@mesa_id", m.MesaId);
-        det.Parameters.AddWithValue("@sector", NormalizarSector(m.SucursalId, d.Sector));
+        det.Parameters.AddWithValue("@sector", sector);
         det.Parameters.AddWithValue("@producto", d.Producto ?? "");
         det.Parameters.AddWithValue("@presentacion", d.Presentacion ?? "");
         det.Parameters.AddWithValue("@cantidad", d.Cantidad);
@@ -2932,55 +2993,57 @@ app.MapPost("/api/mesas/estado", async (Db db, SheetsReporter sheets, MesaEstado
         await det.ExecuteNonQueryAsync();
     }
 
-    return Results.Ok(new { ok = true, syncKey });
+    return Results.Ok(new { ok = true, syncKey, sector });
 });
 
-app.MapGet("/api/mesas/estado", async (Db db, int? sucursalId) =>
+app.MapGet("/api/mesas/estado", async (Db db, int? sucursalId, string? sector) =>
 {
     await using var con = await db.OpenAsync();
     await EnsureMesasEnVivoTables(con);
 
-    string where = sucursalId.HasValue ? "WHERE e.sucursal_id = @sucursal_id" : "";
+    int? sid = sucursalId.HasValue ? (sucursalId.Value == 2 ? 2 : 1) : null;
+    string? sectorFiltro = sid.HasValue ? NormalizarSector(sid.Value, sector) : null;
+    string where = sid.HasValue ? "WHERE e.sucursal_id=@sucursal_id AND e.sector=@sector" : "";
 
     string sql = $"""
         SELECT e.sucursal_id,
                CASE WHEN e.sucursal_id = 2 THEN 'EL BRUJO PREMIU' ELSE 'EL BRUJO' END AS sucursal,
-               e.mesa_id, e.mesa, e.estado, e.cajero, e.inicio, e.fin_programado,
+               e.sector, e.mesa_id, e.mesa, e.estado, e.cajero, e.inicio, e.fin_programado,
                e.minutos, e.tarifa_hora, e.total_mesa, e.total_consumo, e.total_general,
                e.cliente_reserva, e.actualizado
         FROM mesa_estados e
         {where}
-        ORDER BY e.sucursal_id, e.mesa_id;
+        ORDER BY e.sucursal_id, e.sector, e.mesa_id;
     """;
 
-    Dictionary<string, object?>? parameters = sucursalId.HasValue
-        ? new Dictionary<string, object?> { ["@sucursal_id"] = sucursalId.Value }
+    Dictionary<string, object?>? parameters = sid.HasValue
+        ? new Dictionary<string, object?> { ["@sucursal_id"] = sid.Value, ["@sector"] = sectorFiltro! }
         : null;
-
     return Results.Ok(await db.QueryAsync(con, sql, parameters));
 });
 
-app.MapGet("/api/mesas/consumos-vivos", async (Db db, int? sucursalId) =>
+app.MapGet("/api/mesas/consumos-vivos", async (Db db, int? sucursalId, string? sector) =>
 {
     await using var con = await db.OpenAsync();
     await EnsureMesasEnVivoTables(con);
 
-    string where = sucursalId.HasValue ? "WHERE c.sucursal_id = @sucursal_id" : "";
+    int? sid = sucursalId.HasValue ? (sucursalId.Value == 2 ? 2 : 1) : null;
+    string? sectorFiltro = sid.HasValue ? NormalizarSector(sid.Value, sector) : null;
+    string where = sid.HasValue ? "WHERE c.sucursal_id=@sucursal_id AND c.sector=@sector" : "";
 
     string sql = $"""
         SELECT c.sucursal_id,
                CASE WHEN c.sucursal_id = 2 THEN 'EL BRUJO PREMIU' ELSE 'EL BRUJO' END AS sucursal,
-               c.mesa_id, COALESCE(NULLIF(c.sector,''), CASE WHEN c.sucursal_id=2 THEN 'ARRIBA' ELSE 'GENERAL' END) AS sector, c.producto, c.presentacion, c.cantidad, c.precio_unitario, c.subtotal,
+               c.mesa_id, c.sector, c.producto, c.presentacion, c.cantidad, c.precio_unitario, c.subtotal,
                c.mobile_order_id, c.stock_already_discounted_online, COALESCE(c.consumption_key,'') AS consumption_key
         FROM mesa_consumos_vivos c
         {where}
-        ORDER BY c.sucursal_id, c.mesa_id, c.id;
+        ORDER BY c.sucursal_id, c.sector, c.mesa_id, c.id;
     """;
 
-    Dictionary<string, object?>? parameters = sucursalId.HasValue
-        ? new Dictionary<string, object?> { ["@sucursal_id"] = sucursalId.Value }
+    Dictionary<string, object?>? parameters = sid.HasValue
+        ? new Dictionary<string, object?> { ["@sucursal_id"] = sid.Value, ["@sector"] = sectorFiltro! }
         : null;
-
     return Results.Ok(await db.QueryAsync(con, sql, parameters));
 });
 
@@ -3343,10 +3406,11 @@ static async Task TrySyncSheets(Db db, SheetsReporter sheets)
     {
         await sheets.SyncFromDatabaseAsync(db);
     }
-    catch
+    catch (Exception ex)
     {
         // No se debe perder la venta si Google Sheets falla.
         // La venta ya queda guardada en MySQL y luego se puede forzar /api/sheets/sync.
+        Console.Error.WriteLine("[GoogleSheets] Sincronización pendiente: " + ex.Message);
     }
 }
 
@@ -4183,7 +4247,10 @@ static async Task<(bool ok, string message)> AcquireSaleGuardsAsync(MySqlConnect
 
     string tipo = (venta.Tipo ?? "").Trim().ToUpperInvariant();
     if (tipo == "MESA" && venta.SessionId.HasValue && venta.SessionId.Value > 0)
-        lockNames.Add($"MESAFINAL_{venta.SucursalId}_{venta.SessionId.Value}");
+        lockNames.Add("MESAFINAL_" + HashKey(
+            venta.SucursalId.ToString(System.Globalization.CultureInfo.InvariantCulture) + "|" +
+            (venta.CajaNombre ?? "").Trim().ToUpperInvariant() + "|" +
+            venta.SessionId.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
 
     if (venta.Detalle != null)
     {
@@ -4430,7 +4497,7 @@ static async Task EnsureVentaSyncProtection(MySqlConnection con)
                                WHEN v.legacy_fingerprint IS NOT NULL AND TRIM(v.legacy_fingerprint) <> ''
                                    THEN CONCAT('FP|', LOWER(TRIM(v.legacy_fingerprint)))
                                WHEN UPPER(TRIM(COALESCE(v.tipo,''))) = 'MESA' AND COALESCE(v.session_id,0) > 0
-                                   THEN CONCAT('MESA|', v.sucursal_id, '|', v.session_id)
+                                   THEN CONCAT('MESA|', v.sucursal_id, '|', UPPER(TRIM(COALESCE(v.caja_nombre,''))), '|', v.session_id)
                                ELSE CONCAT(
                                    'ECON|', v.sucursal_id, '|', UPPER(TRIM(COALESCE(v.cajero,''))), '|',
                                    UPPER(TRIM(COALESCE(v.tipo,''))), '|', UPPER(TRIM(COALESCE(v.metodo_pago,''))), '|',
@@ -5454,6 +5521,7 @@ static async Task EnsureMesasEnVivoTables(MySqlConnection con)
         CREATE TABLE IF NOT EXISTS mesa_estados (
             id BIGINT AUTO_INCREMENT PRIMARY KEY,
             sucursal_id INT NOT NULL,
+            sector VARCHAR(20) NOT NULL DEFAULT 'GENERAL',
             mesa_id INT NOT NULL,
             mesa VARCHAR(100) NOT NULL,
             estado VARCHAR(50) NOT NULL,
@@ -5468,17 +5536,18 @@ static async Task EnsureMesasEnVivoTables(MySqlConnection con)
             cliente_reserva VARCHAR(150) NULL,
             actualizado DATETIME NOT NULL,
             sync_key VARCHAR(180) NOT NULL,
-            UNIQUE KEY uk_mesa_estado (sucursal_id, mesa_id)
+            UNIQUE KEY uk_mesa_estado_sector (sucursal_id, sector, mesa_id),
+            UNIQUE KEY uk_mesa_estado_sync_key (sync_key)
         );
-    """, con))
-    {
-        await cmd.ExecuteNonQueryAsync();
-    }
+    """, con)) await cmd.ExecuteNonQueryAsync();
 
-    await using (var alterRate = new MySqlCommand("ALTER TABLE mesa_estados ADD COLUMN tarifa_hora DECIMAL(10,2) NOT NULL DEFAULT 20.00 AFTER minutos;", con))
-    {
-        try { await alterRate.ExecuteNonQueryAsync(); } catch { }
-    }
+    try { await new MySqlCommand("ALTER TABLE mesa_estados ADD COLUMN sector VARCHAR(20) NOT NULL DEFAULT 'GENERAL' AFTER sucursal_id;", con).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE mesa_estados ADD COLUMN tarifa_hora DECIMAL(10,2) NOT NULL DEFAULT 20.00 AFTER minutos;", con).ExecuteNonQueryAsync(); } catch { }
+    // V158/V74: se elimina la identidad antigua sucursal+mesa, porque Mesa 1 ARRIBA y Mesa 1 ABAJO son físicas distintas.
+    try { await new MySqlCommand("ALTER TABLE mesa_estados DROP INDEX uk_mesa_estado;", con).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE mesa_estados DROP INDEX uk_mesa_estado_sucursal_mesa;", con).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE mesa_estados ADD UNIQUE KEY uk_mesa_estado_sector (sucursal_id, sector, mesa_id);", con).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE mesa_estados ADD UNIQUE KEY uk_mesa_estado_sync_key (sync_key);", con).ExecuteNonQueryAsync(); } catch { }
 
     await using (var cmd = new MySqlCommand("""
         CREATE TABLE IF NOT EXISTS mesa_consumos_vivos (
@@ -5495,25 +5564,23 @@ static async Task EnsureMesasEnVivoTables(MySqlConnection con)
             stock_already_discounted_online TINYINT(1) NOT NULL DEFAULT 0,
             consumption_key VARCHAR(180) NULL,
             actualizado DATETIME NOT NULL,
-            INDEX idx_mesa_consumos_vivos (sucursal_id, mesa_id)
+            INDEX idx_mesa_consumos_vivos (sucursal_id, sector, mesa_id)
         );
-    """, con))
-    {
-        await cmd.ExecuteNonQueryAsync();
-    }
+    """, con)) await cmd.ExecuteNonQueryAsync();
 
-    // V42: una misma mesa se identifica SIEMPRE por sucursal + mesa_id.
-    // También se intenta blindar sync_key para que una mesa de otra sucursal nunca pise su estado.
-    try { await new MySqlCommand("ALTER TABLE mesa_estados ADD UNIQUE KEY uk_mesa_estado_sucursal_mesa (sucursal_id, mesa_id);", con).ExecuteNonQueryAsync(); } catch { }
-    try { await new MySqlCommand("ALTER TABLE mesa_estados ADD UNIQUE KEY uk_mesa_estado_sync_key (sync_key);", con).ExecuteNonQueryAsync(); } catch { }
-
-    // Compatibilidad con bases ya creadas en versiones anteriores.
     try { await new MySqlCommand("ALTER TABLE mesa_consumos_vivos ADD COLUMN mobile_order_id BIGINT NOT NULL DEFAULT 0;", con).ExecuteNonQueryAsync(); } catch { }
     try { await new MySqlCommand("ALTER TABLE mesa_consumos_vivos ADD COLUMN sector VARCHAR(20) NOT NULL DEFAULT 'GENERAL';", con).ExecuteNonQueryAsync(); } catch { }
-    try { await new MySqlCommand("UPDATE mesa_consumos_vivos SET sector=CASE WHEN sucursal_id=2 THEN 'ARRIBA' ELSE 'GENERAL' END WHERE sector IS NULL OR TRIM(sector)='' OR (sucursal_id=2 AND UPPER(sector)='GENERAL');", con).ExecuteNonQueryAsync(); } catch { }
     try { await new MySqlCommand("ALTER TABLE mesa_consumos_vivos ADD COLUMN stock_already_discounted_online TINYINT(1) NOT NULL DEFAULT 0;", con).ExecuteNonQueryAsync(); } catch { }
     try { await new MySqlCommand("ALTER TABLE mesa_consumos_vivos ADD COLUMN consumption_key VARCHAR(180) NULL;", con).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE mesa_consumos_vivos ADD INDEX idx_mesa_consumos_sector (sucursal_id, sector, mesa_id);", con).ExecuteNonQueryAsync(); } catch { }
     try { await new MySqlCommand("ALTER TABLE mesa_consumos_vivos ADD INDEX idx_mesa_consumption_key (consumption_key);", con).ExecuteNonQueryAsync(); } catch { }
+
+    // Los estados antiguos de PREMIU no indicaban si eran ARRIBA o ABAJO y ya causaron cruces de reloj.
+    // Son datos transitorios, no ventas: se limpian una sola vez de forma segura por quedar en GENERAL.
+    try { await new MySqlCommand("DELETE FROM mesa_consumos_vivos WHERE sucursal_id=2 AND UPPER(COALESCE(sector,'GENERAL'))='GENERAL';", con).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("DELETE FROM mesa_estados WHERE sucursal_id=2 AND UPPER(COALESCE(sector,'GENERAL'))='GENERAL';", con).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("UPDATE mesa_estados SET sector='GENERAL' WHERE sucursal_id=1;", con).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("UPDATE mesa_consumos_vivos SET sector='GENERAL' WHERE sucursal_id=1;", con).ExecuteNonQueryAsync(); } catch { }
 }
 
 static class PasswordHasher
@@ -5661,18 +5728,147 @@ public sealed class SheetsReporter
 {
     private readonly string _sheetId;
     private readonly string _credentialsJson;
+    private readonly string _serviceAccountEmail;
+    private readonly string _configurationError;
 
     public SheetsReporter()
     {
-        _sheetId = Environment.GetEnvironmentVariable("GOOGLE_SHEET_ID") ?? "";
-        _credentialsJson = Environment.GetEnvironmentVariable("GOOGLE_CREDENTIALS_JSON") ?? "";
+        string rawSheetId = Environment.GetEnvironmentVariable("GOOGLE_SHEET_ID") ?? "";
+        _sheetId = NormalizeSpreadsheetId(rawSheetId);
+
+        string rawCredentials = Environment.GetEnvironmentVariable("GOOGLE_CREDENTIALS_JSON") ?? "";
+        string credentialsBase64 = Environment.GetEnvironmentVariable("GOOGLE_CREDENTIALS_JSON_BASE64") ?? "";
+        _credentialsJson = NormalizeCredentials(rawCredentials, credentialsBase64);
+
+        (_serviceAccountEmail, _configurationError) = ReadCredentialMetadata(_credentialsJson);
     }
 
     public bool IsConfigured =>
         !string.IsNullOrWhiteSpace(_sheetId) &&
-        !string.IsNullOrWhiteSpace(_credentialsJson);
+        !string.IsNullOrWhiteSpace(_credentialsJson) &&
+        string.IsNullOrWhiteSpace(_configurationError);
 
     public string SpreadsheetId => string.IsNullOrWhiteSpace(_sheetId) ? "(sin configurar)" : _sheetId;
+    public string ServiceAccountEmail => string.IsNullOrWhiteSpace(_serviceAccountEmail) ? "(no detectado)" : _serviceAccountEmail;
+
+    public async Task<SheetsConnectionTest> TestConnectionAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_sheetId))
+        {
+            return new SheetsConnectionTest(false, false, "(sin configurar)", "", ServiceAccountEmail,
+                "Falta GOOGLE_SHEET_ID en Railway. Puedes pegar solo el ID o la URL completa de Google Sheets.");
+        }
+
+        if (string.IsNullOrWhiteSpace(_credentialsJson))
+        {
+            return new SheetsConnectionTest(false, false, _sheetId, "", ServiceAccountEmail,
+                "Falta GOOGLE_CREDENTIALS_JSON en Railway. También se admite GOOGLE_CREDENTIALS_JSON_BASE64.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(_configurationError))
+        {
+            return new SheetsConnectionTest(false, false, _sheetId, "", ServiceAccountEmail,
+                "Las credenciales de Google no son JSON válidas: " + _configurationError);
+        }
+
+        try
+        {
+            var service = CreateService();
+            var request = service.Spreadsheets.Get(_sheetId);
+            request.Fields = "spreadsheetId,properties.title";
+            var spreadsheet = await request.ExecuteAsync();
+            string title = spreadsheet.Properties?.Title ?? "";
+
+            return new SheetsConnectionTest(true, true, _sheetId, title, ServiceAccountEmail,
+                "Conexión REAL correcta. La cuenta de servicio tiene acceso al archivo y la API puede leer/escribir Google Sheets.");
+        }
+        catch (Exception ex)
+        {
+            string raw = ex.Message ?? ex.GetType().Name;
+            string friendly;
+            if (raw.Contains("403") || raw.Contains("permission", StringComparison.OrdinalIgnoreCase) || raw.Contains("forbidden", StringComparison.OrdinalIgnoreCase))
+                friendly = "Google rechazó el permiso. Comparte el archivo de Google Sheets con " + ServiceAccountEmail + " como EDITOR.";
+            else if (raw.Contains("404") || raw.Contains("not found", StringComparison.OrdinalIgnoreCase))
+                friendly = "Google no encontró el archivo. Revisa GOOGLE_SHEET_ID y confirma que el Sheet esté compartido con " + ServiceAccountEmail + ".";
+            else if (raw.Contains("invalid_grant", StringComparison.OrdinalIgnoreCase) || raw.Contains("credential", StringComparison.OrdinalIgnoreCase) || raw.Contains("private key", StringComparison.OrdinalIgnoreCase))
+                friendly = "La credencial de la cuenta de servicio no es válida. Revisa GOOGLE_CREDENTIALS_JSON en Railway.";
+            else
+                friendly = "No se pudo conectar realmente con Google Sheets: " + raw;
+
+            return new SheetsConnectionTest(false, true, _sheetId, "", ServiceAccountEmail, friendly);
+        }
+    }
+
+    private static string NormalizeSpreadsheetId(string raw)
+    {
+        raw = (raw ?? "").Trim().Trim('"', '\'');
+        if (string.IsNullOrWhiteSpace(raw)) return "";
+
+        const string marker = "/spreadsheets/d/";
+        int p = raw.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (p >= 0)
+        {
+            string rest = raw[(p + marker.Length)..];
+            int end = rest.IndexOfAny(new[] { '/', '?', '#', '&' });
+            return (end >= 0 ? rest[..end] : rest).Trim();
+        }
+
+        int cut = raw.IndexOfAny(new[] { '?', '#', '&' });
+        if (cut >= 0) raw = raw[..cut];
+        return raw.Trim().Trim('/');
+    }
+
+    private static string NormalizeCredentials(string rawJson, string rawBase64)
+    {
+        string value = (rawJson ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(value) && !string.IsNullOrWhiteSpace(rawBase64))
+        {
+            try
+            {
+                value = Encoding.UTF8.GetString(Convert.FromBase64String(rawBase64.Trim()));
+            }
+            catch
+            {
+                return rawBase64.Trim(); // TestConnectionAsync devolverá un diagnóstico claro.
+            }
+        }
+
+        // Algunas interfaces guardan el JSON completo entre comillas como una cadena JSON.
+        if (value.Length >= 2 && value[0] == '"' && value[^1] == '"')
+        {
+            try
+            {
+                string? decoded = JsonSerializer.Deserialize<string>(value);
+                if (!string.IsNullOrWhiteSpace(decoded)) value = decoded;
+            }
+            catch { }
+        }
+
+        return value.Trim();
+    }
+
+    private static (string Email, string Error) ReadCredentialMetadata(string json)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return ("", "");
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            string email = root.TryGetProperty("client_email", out var e) ? (e.GetString() ?? "") : "";
+            string type = root.TryGetProperty("type", out var t) ? (t.GetString() ?? "") : "";
+            if (!string.Equals(type, "service_account", StringComparison.OrdinalIgnoreCase))
+                return (email, "el campo type debe ser service_account");
+            if (string.IsNullOrWhiteSpace(email))
+                return ("", "falta client_email");
+            if (!root.TryGetProperty("private_key", out var pk) || string.IsNullOrWhiteSpace(pk.GetString()))
+                return (email, "falta private_key");
+            return (email, "");
+        }
+        catch (Exception ex)
+        {
+            return ("", ex.Message);
+        }
+    }
 
     public async Task<string> SyncFromDatabaseAsync(Db db)
     {
@@ -5690,11 +5886,13 @@ public sealed class SheetsReporter
         {
             "EL_BRUJO_CIERRES",
             "EL_BRUJO_VENTAS",
+            "EL_BRUJO_DETALLE_VENTAS",
             "EL_BRUJO_PRODUCTOS",
             "EL_BRUJO_INVENTARIO",
             "EL_BRUJO_MESERAS",
             "EL_BRUJO_PREMIU_CIERRES",
             "EL_BRUJO_PREMIU_VENTAS",
+            "EL_BRUJO_PREMIU_DETALLE_VENTAS",
             "EL_BRUJO_PREMIU_PRODUCTOS",
             "EL_BRUJO_PREMIU_INVENTARIO",
             "EL_BRUJO_PREMIU_MESERAS"
@@ -5756,6 +5954,191 @@ public sealed class SheetsReporter
             {
                 Val(r, "id"), DateOnlyText(r, "fecha_turno"), Text(r, "turno"), DateOnlyText(r, "fecha"), Text(r, "hora"),
                 Text(r, "cajero"), Text(r, "tipo"), Text(r, "metodo_pago"), Val(r, "efectivo"), Val(r, "qr"), Val(r, "transferencia"), Val(r, "total"), Text(r, "caja"), Text(r, "sector")
+            }));
+
+            // V72: detalle auditable de ventas. Una fila por producto, sin inflar totales.
+            // Los importes de pago y el total de venta se escriben solo en la primera línea
+            // de cada venta; así SUM(efectivo/qr/transferencia/total_venta) sigue cuadrando.
+            // Si la venta es solo tiempo de mesa, LEFT JOIN genera igualmente una fila.
+            bool hasCobrosMesa = await TableExistsAsync(con, "cobros_mesa");
+            string detalleVentasSql = hasCobrosMesa ? """
+                SELECT z.id, z.fecha_turno, z.turno, z.fecha, z.hora, z.cajero, z.caja, z.sector,
+                       z.tipo, z.mesa, z.mesera, z.tiempo_mesa,
+                       z.producto, z.presentacion, z.cantidad, z.precio_unitario, z.subtotal_producto,
+                       CASE WHEN z.linea_venta = 1 THEN z.costo_tiempo_base ELSE 0 END AS costo_tiempo,
+                       CASE WHEN z.linea_venta = 1 THEN z.ajuste_redondeo_base ELSE 0 END AS ajuste_redondeo,
+                       z.subtotal_producto
+                         + CASE WHEN z.linea_venta = 1 THEN z.costo_tiempo_base ELSE 0 END
+                         + CASE WHEN z.linea_venta = 1 THEN z.ajuste_redondeo_base ELSE 0 END AS total_linea,
+                       z.metodo_pago,
+                       CASE WHEN z.linea_venta = 1 THEN z.efectivo ELSE 0 END AS efectivo,
+                       CASE WHEN z.linea_venta = 1 THEN z.qr ELSE 0 END AS qr,
+                       CASE WHEN z.linea_venta = 1 THEN z.transferencia ELSE 0 END AS transferencia,
+                       CASE WHEN z.linea_venta = 1 THEN z.total ELSE 0 END AS total_venta,
+                       z.sync_key
+                FROM (
+                    SELECT v.id,
+                           CASE
+                               WHEN UPPER(COALESCE(NULLIF(v.turno,''), CASE WHEN TIME(v.fecha) >= '08:00:00' AND TIME(v.fecha) < '20:00:00' THEN 'MAÑANA' ELSE 'NOCHE' END)) = 'NOCHE'
+                                    AND TIME(v.fecha) < '20:00:00'
+                                   THEN DATE(DATE_SUB(v.fecha, INTERVAL 1 DAY))
+                               ELSE DATE(v.fecha)
+                           END AS fecha_turno,
+                           COALESCE(NULLIF(v.turno,''), CASE
+                               WHEN TIME(v.fecha) >= '08:00:00' AND TIME(v.fecha) < '20:00:00' THEN 'MAÑANA'
+                               ELSE 'NOCHE'
+                           END) AS turno,
+                           DATE(v.fecha) AS fecha,
+                           TIME(v.fecha) AS hora,
+                           v.cajero,
+                           CASE
+                               WHEN v.sucursal_id = 1 THEN 'CAJA ÚNICA'
+                               WHEN UPPER(COALESCE(NULLIF(v.caja_nombre,''), u.caja_nombre, '')) IN ('CAJA 1','CAJA ARRIBA') THEN 'CAJA ARRIBA'
+                               WHEN UPPER(COALESCE(NULLIF(v.caja_nombre,''), u.caja_nombre, '')) IN ('CAJA 2','CAJA ABAJO') THEN 'CAJA ABAJO'
+                               ELSE COALESCE(NULLIF(v.caja_nombre,''), NULLIF(u.caja_nombre,''), 'SIN CAJA')
+                           END AS caja,
+                           CASE
+                               WHEN v.sucursal_id = 1 THEN 'GENERAL'
+                               WHEN UPPER(COALESCE(NULLIF(d.sector,''), NULLIF(v.caja_nombre,''), u.caja_nombre, '')) IN ('ABAJO','CAJA 2','CAJA ABAJO') THEN 'ABAJO'
+                               ELSE COALESCE(NULLIF(d.sector,''), NULLIF(u.sector,''), 'ARRIBA')
+                           END AS sector,
+                           v.tipo,
+                           CASE
+                               WHEN COALESCE(cm.mesa,'') <> '' THEN cm.mesa
+                               WHEN UPPER(COALESCE(v.tipo,'')) = 'DIRECTA' THEN 'BAR / VENTA DIRECTA'
+                               WHEN COALESCE(v.session_id,0) > 0 THEN CONCAT('SESIÓN ', v.session_id)
+                               ELSE ''
+                           END AS mesa,
+                           COALESCE(cm.mesera,'') AS mesera,
+                           COALESCE(cm.tiempo,'') AS tiempo_mesa,
+                           COALESCE(d.producto,'') AS producto,
+                           COALESCE(d.presentacion,'') AS presentacion,
+                           COALESCE(d.cantidad,0) AS cantidad,
+                           COALESCE(d.precio_unitario,0) AS precio_unitario,
+                           COALESCE(d.subtotal,0) AS subtotal_producto,
+                           CASE WHEN UPPER(COALESCE(v.tipo,''))='MESA'
+                                THEN GREATEST(COALESCE(cm.total_mesa,
+                                     v.total - SUM(COALESCE(d.subtotal,0)) OVER (PARTITION BY v.id)), 0)
+                                ELSE 0 END AS costo_tiempo_base,
+                           v.total
+                             - SUM(COALESCE(d.subtotal,0)) OVER (PARTITION BY v.id)
+                             - CASE WHEN UPPER(COALESCE(v.tipo,''))='MESA'
+                                  THEN GREATEST(COALESCE(cm.total_mesa,
+                                       v.total - SUM(COALESCE(d.subtotal,0)) OVER (PARTITION BY v.id)), 0)
+                                  ELSE 0 END AS ajuste_redondeo_base,
+                           v.metodo_pago,
+                           COALESCE(v.efectivo,0) AS efectivo,
+                           COALESCE(v.qr,0) AS qr,
+                           CASE WHEN UPPER(COALESCE(v.metodo_pago,''))='TRANSFERENCIA' THEN v.total ELSE 0 END AS transferencia,
+                           v.total,
+                           COALESCE(v.sync_key,'') AS sync_key,
+                           d.id AS detalle_id,
+                           ROW_NUMBER() OVER (PARTITION BY v.id ORDER BY COALESCE(d.id,0)) AS linea_venta
+                    FROM ventas_canonicas v
+                    LEFT JOIN detalle_ventas_canonico d ON d.venta_id = v.id
+                    LEFT JOIN usuarios u ON u.usuario = v.cajero AND u.sucursal_id = v.sucursal_id
+                    LEFT JOIN cobros_mesa cm ON cm.sucursal_id = v.sucursal_id
+                        AND cm.session_id = v.session_id
+                        AND UPPER(TRIM(COALESCE(cm.caja_nombre,''))) = UPPER(TRIM(COALESCE(v.caja_nombre,'')))
+                    WHERE v.sucursal_id = @sucursal_id
+                ) z
+                ORDER BY z.fecha DESC, z.hora DESC, z.id DESC, COALESCE(z.detalle_id,0);
+            """ : """
+                SELECT z.id, z.fecha_turno, z.turno, z.fecha, z.hora, z.cajero, z.caja, z.sector,
+                       z.tipo, z.mesa, z.mesera, z.tiempo_mesa,
+                       z.producto, z.presentacion, z.cantidad, z.precio_unitario, z.subtotal_producto,
+                       CASE WHEN z.linea_venta = 1 THEN z.costo_tiempo_base ELSE 0 END AS costo_tiempo,
+                       CASE WHEN z.linea_venta = 1 THEN z.ajuste_redondeo_base ELSE 0 END AS ajuste_redondeo,
+                       z.subtotal_producto
+                         + CASE WHEN z.linea_venta = 1 THEN z.costo_tiempo_base ELSE 0 END
+                         + CASE WHEN z.linea_venta = 1 THEN z.ajuste_redondeo_base ELSE 0 END AS total_linea,
+                       z.metodo_pago,
+                       CASE WHEN z.linea_venta = 1 THEN z.efectivo ELSE 0 END AS efectivo,
+                       CASE WHEN z.linea_venta = 1 THEN z.qr ELSE 0 END AS qr,
+                       CASE WHEN z.linea_venta = 1 THEN z.transferencia ELSE 0 END AS transferencia,
+                       CASE WHEN z.linea_venta = 1 THEN z.total ELSE 0 END AS total_venta,
+                       z.sync_key
+                FROM (
+                    SELECT v.id,
+                           CASE
+                               WHEN UPPER(COALESCE(NULLIF(v.turno,''), CASE WHEN TIME(v.fecha) >= '08:00:00' AND TIME(v.fecha) < '20:00:00' THEN 'MAÑANA' ELSE 'NOCHE' END)) = 'NOCHE'
+                                    AND TIME(v.fecha) < '20:00:00'
+                                   THEN DATE(DATE_SUB(v.fecha, INTERVAL 1 DAY))
+                               ELSE DATE(v.fecha)
+                           END AS fecha_turno,
+                           COALESCE(NULLIF(v.turno,''), CASE
+                               WHEN TIME(v.fecha) >= '08:00:00' AND TIME(v.fecha) < '20:00:00' THEN 'MAÑANA'
+                               ELSE 'NOCHE'
+                           END) AS turno,
+                           DATE(v.fecha) AS fecha,
+                           TIME(v.fecha) AS hora,
+                           v.cajero,
+                           CASE
+                               WHEN v.sucursal_id = 1 THEN 'CAJA ÚNICA'
+                               WHEN UPPER(COALESCE(NULLIF(v.caja_nombre,''), u.caja_nombre, '')) IN ('CAJA 1','CAJA ARRIBA') THEN 'CAJA ARRIBA'
+                               WHEN UPPER(COALESCE(NULLIF(v.caja_nombre,''), u.caja_nombre, '')) IN ('CAJA 2','CAJA ABAJO') THEN 'CAJA ABAJO'
+                               ELSE COALESCE(NULLIF(v.caja_nombre,''), NULLIF(u.caja_nombre,''), 'SIN CAJA')
+                           END AS caja,
+                           CASE
+                               WHEN v.sucursal_id = 1 THEN 'GENERAL'
+                               WHEN UPPER(COALESCE(NULLIF(d.sector,''), NULLIF(v.caja_nombre,''), u.caja_nombre, '')) IN ('ABAJO','CAJA 2','CAJA ABAJO') THEN 'ABAJO'
+                               ELSE COALESCE(NULLIF(d.sector,''), NULLIF(u.sector,''), 'ARRIBA')
+                           END AS sector,
+                           v.tipo,
+                           CASE
+                               WHEN UPPER(COALESCE(v.tipo,'')) = 'DIRECTA' THEN 'BAR / VENTA DIRECTA'
+                               WHEN COALESCE(v.session_id,0) > 0 THEN CONCAT('SESIÓN ', v.session_id)
+                               ELSE ''
+                           END AS mesa,
+                           '' AS mesera,
+                           '' AS tiempo_mesa,
+                           COALESCE(d.producto,'') AS producto,
+                           COALESCE(d.presentacion,'') AS presentacion,
+                           COALESCE(d.cantidad,0) AS cantidad,
+                           COALESCE(d.precio_unitario,0) AS precio_unitario,
+                           COALESCE(d.subtotal,0) AS subtotal_producto,
+                           GREATEST(CASE WHEN UPPER(COALESCE(v.tipo,''))='MESA'
+                               THEN v.total - SUM(COALESCE(d.subtotal,0)) OVER (PARTITION BY v.id)
+                               ELSE 0 END, 0) AS costo_tiempo_base,
+                           v.total
+                             - SUM(COALESCE(d.subtotal,0)) OVER (PARTITION BY v.id)
+                             - GREATEST(CASE WHEN UPPER(COALESCE(v.tipo,''))='MESA'
+                                 THEN v.total - SUM(COALESCE(d.subtotal,0)) OVER (PARTITION BY v.id)
+                                 ELSE 0 END, 0) AS ajuste_redondeo_base,
+                           v.metodo_pago,
+                           COALESCE(v.efectivo,0) AS efectivo,
+                           COALESCE(v.qr,0) AS qr,
+                           CASE WHEN UPPER(COALESCE(v.metodo_pago,''))='TRANSFERENCIA' THEN v.total ELSE 0 END AS transferencia,
+                           v.total,
+                           COALESCE(v.sync_key,'') AS sync_key,
+                           d.id AS detalle_id,
+                           ROW_NUMBER() OVER (PARTITION BY v.id ORDER BY COALESCE(d.id,0)) AS linea_venta
+                    FROM ventas_canonicas v
+                    LEFT JOIN detalle_ventas_canonico d ON d.venta_id = v.id
+                    LEFT JOIN usuarios u ON u.usuario = v.cajero AND u.sucursal_id = v.sucursal_id
+                    WHERE v.sucursal_id = @sucursal_id
+                ) z
+                ORDER BY z.fecha DESC, z.hora DESC, z.id DESC, COALESCE(z.detalle_id,0);
+            """;
+
+            List<List<object>> detalleVentas = new()
+            {
+                new()
+                {
+                    "id_venta", "fecha_turno", "turno", "fecha", "hora", "cajero", "caja", "sector", "tipo",
+                    "mesa", "mesera", "tiempo_mesa", "producto", "presentacion", "cantidad", "precio_unitario",
+                    "subtotal_producto", "costo_tiempo", "ajuste_redondeo", "total_linea", "metodo_pago",
+                    "efectivo", "qr", "transferencia", "total_venta", "sync_key"
+                }
+            };
+
+            detalleVentas.AddRange((await db.QueryAsync(con, detalleVentasSql, args)).Select(r => new List<object>
+            {
+                Val(r, "id"), DateOnlyText(r, "fecha_turno"), Text(r, "turno"), DateOnlyText(r, "fecha"), Text(r, "hora"),
+                Text(r, "cajero"), Text(r, "caja"), Text(r, "sector"), Text(r, "tipo"), Text(r, "mesa"), Text(r, "mesera"),
+                Text(r, "tiempo_mesa"), Text(r, "producto"), Text(r, "presentacion"), Val(r, "cantidad"), Val(r, "precio_unitario"),
+                Val(r, "subtotal_producto"), Val(r, "costo_tiempo"), Val(r, "ajuste_redondeo"), Val(r, "total_linea"), Text(r, "metodo_pago"),
+                Val(r, "efectivo"), Val(r, "qr"), Val(r, "transferencia"), Val(r, "total_venta"), Text(r, "sync_key")
             }));
 
             // V53: PRODUCTOS es un resumen diario. El mismo producto/presentación aparece
@@ -5953,11 +6336,13 @@ public sealed class SheetsReporter
 
             await ReplaceSheetAsync(service, prefix + "_CIERRES", cierres);
             await ReplaceSheetAsync(service, prefix + "_VENTAS", ventas);
+            await ReplaceSheetAsync(service, prefix + "_DETALLE_VENTAS", detalleVentas);
             await ReplaceSheetAsync(service, prefix + "_PRODUCTOS", productos);
             await ReplaceSheetAsync(service, prefix + "_INVENTARIO", inventario);
             await ReplaceSheetAsync(service, prefix + "_MESERAS", meseras);
 
             syncSummary.Add(prefix + ": ventas " + Math.Max(0, ventas.Count - 1) +
+                            ", detalle " + Math.Max(0, detalleVentas.Count - 1) +
                             ", cierres " + Math.Max(0, cierres.Count - 1) +
                             ", productos " + Math.Max(0, productos.Count - 1) +
                             ", inventario " + Math.Max(0, inventario.Count - 1) +
@@ -6105,6 +6490,7 @@ public record MesaConsumoVivoRequest(
 public record MesaEstadoRequest(
     int SucursalId,
     int MesaId,
+    string? Sector,
     string? Mesa,
     string? Estado,
     string? Cajero,
@@ -6270,6 +6656,8 @@ public record CobroMesaRequest(
     int? SessionId,
     int? MesaId,
     string? Mesa,
+    string? CajaNombre,
+    string? Sector,
     string? Cajero,
     string? Mesera,
     DateTime Fecha,
@@ -6603,3 +6991,12 @@ public static class CompositeInventoryDb
         return (true, "", description, parts);
     }
 }
+
+
+public sealed record SheetsConnectionTest(
+    bool Ok,
+    bool Configured,
+    string SpreadsheetId,
+    string SpreadsheetTitle,
+    string ServiceAccountEmail,
+    string Message);
