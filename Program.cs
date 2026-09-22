@@ -98,10 +98,10 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
 app.MapGet("/api/system/version", () => Results.Ok(new
 {
     ok = true,
-    apiVersion = "V79_COMBOS_CANTIDAD_AUTOMATICA",
-    minimumClientVersion = 163,
+    apiVersion = "V81_PROMO_PRIVADA_EDITABLE",
+    minimumClientVersion = 164,
     accountingMode = "LIBRO_INMUTABLE_TRANSACCIONAL",
-    message = "API V80. Promoción 2x1 configurable por sucursal/sector/fechas; conserva combos, anti-duplicado y vasos."
+    message = "API V81. Promoción 2x1 configurable con tarifa independiente NORMAL/PRIVADA; conserva stock por sector, combos, anti-duplicado y vasos."
 }));
 
 app.MapGet("/api/sheets/status", async (SheetsReporter sheets) =>
@@ -1834,6 +1834,7 @@ app.MapGet("/api/config/tarifa-mesas", async (Db db) =>
         precioNormal = pricing.normal,
         precioPromoLunes = pricing.promoLunes,
         precioPrivada = pricing.privada,
+        precioPromoPrivada = pricing.promoPrivada,
         promoLunesActiva = pricing.promoActiva,
         promoLunesSucursal = promoScope.mondayBranch,
         promoLunesSector = promoScope.mondaySector,
@@ -1853,12 +1854,14 @@ app.MapPost("/api/admin/tarifa-mesas", async (Db db, string clave, TableRateRequ
     decimal normal = req.PrecioNormal > 0 ? req.PrecioNormal : req.PrecioHora;
     decimal promo = req.PrecioPromoLunes > 0 ? req.PrecioPromoLunes : 10m;
     decimal privada = req.PrecioPrivada > 0 ? req.PrecioPrivada : 40m;
-    if (normal <= 0 || promo <= 0 || privada <= 0)
-        return Results.BadRequest(new { ok = false, message = "Las tarifas NORMAL, PROMO LUNES y PRIVADA deben ser mayores a 0." });
+    decimal promoPrivada = req.PrecioPromoPrivada > 0 ? req.PrecioPromoPrivada : 20m;
+    if (normal <= 0 || promo <= 0 || privada <= 0 || promoPrivada <= 0)
+        return Results.BadRequest(new { ok = false, message = "Las tarifas NORMAL, PROMO NORMAL, PRIVADA y PROMO PRIVADA deben ser mayores a 0." });
 
     normal = Math.Round(normal, 2);
     promo = Math.Round(promo, 2);
     privada = Math.Round(privada, 2);
+    promoPrivada = Math.Round(promoPrivada, 2);
 
     await using var con = await db.OpenAsync();
     await EnsureTablePricingAsync(con);
@@ -1894,6 +1897,7 @@ app.MapPost("/api/admin/tarifa-mesas", async (Db db, string clave, TableRateRequ
         await SaveValue("TARIFA_MESA_NORMAL", normal);
         await SaveValue("TARIFA_MESA_PROMO_LUNES", promo);
         await SaveValue("TARIFA_MESA_PRIVADA", privada);
+        await SaveValue("TARIFA_MESA_PROMO_PRIVADA", promoPrivada);
         await SaveValue("PROMO_LUNES_ACTIVA", req.PromoLunesActiva ? 1m : 0m);
         await SaveValue("PROMO_LUNES_SUCURSAL", mondayBranch);
         await SaveValue("PROMO_LUNES_SECTOR", mondaySector);
@@ -1931,6 +1935,7 @@ app.MapPost("/api/admin/tarifa-mesas", async (Db db, string clave, TableRateRequ
         precioNormal = normal,
         precioPromoLunes = promo,
         precioPrivada = privada,
+        precioPromoPrivada = promoPrivada,
         promoLunesActiva = req.PromoLunesActiva,
         promoLunesSucursal = mondayBranch,
         promoLunesSector = mondaySector,
@@ -1939,7 +1944,7 @@ app.MapPost("/api/admin/tarifa-mesas", async (Db db, string clave, TableRateRequ
         promoTemporalHasta = PromoDateText(tempEnd),
         promoTemporalSucursal = tempBranch,
         promoTemporalSector = tempSector,
-        message = "Precios/promociones guardados. Se aplican solo a mesas NORMALES al iniciar; las sesiones abiertas conservan su tarifa original."
+        message = "Precios/promociones guardados. NORMAL y PRIVADA usan su propia tarifa promocional al iniciar; las sesiones abiertas conservan su tarifa original."
     });
 });
 
@@ -2296,8 +2301,8 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
     {
         // V45: bloqueo de cajas antiguas. Evita que una versión sin OperationKey/cola offline
         // vuelva a inflar ventas o stock.
-        if (!venta.ClientVersion.HasValue || venta.ClientVersion.Value < 160)
-            return Results.Json(new { ok = false, message = "Caja desactualizada. Se requiere Caja V160 o superior para registrar cobros en Railway.", minimumClientVersion = 160 }, statusCode: StatusCodes.Status426UpgradeRequired);
+        if (!venta.ClientVersion.HasValue || venta.ClientVersion.Value < 164)
+            return Results.Json(new { ok = false, message = "Caja desactualizada. Se requiere Caja V164 o superior para aplicar correctamente promociones NORMAL/PRIVADA.", minimumClientVersion = 164 }, statusCode: StatusCodes.Status426UpgradeRequired);
 
         string syncKey = string.IsNullOrWhiteSpace(venta.SyncKey)
             ? Guid.NewGuid().ToString("N")
@@ -2309,7 +2314,7 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
         // V47: toda Caja V128+ debe traer las dos identidades. Si falta una, NO se inventa
         // una nueva en el servidor, porque eso podría transformar un reintento en otra venta.
         if (string.IsNullOrWhiteSpace(venta.SyncKey) || string.IsNullOrWhiteSpace(operationKey))
-            return Results.BadRequest(new { ok = false, message = "El cobro llegó sin SyncKey u OperationKey. Se bloqueó para evitar duplicación.", minimumClientVersion = 160 });
+            return Results.BadRequest(new { ok = false, message = "El cobro llegó sin SyncKey u OperationKey. Se bloqueó para evitar duplicación.", minimumClientVersion = 164 });
 
         // V54: candados de servidor. Serializan reintentos simultáneos aunque una base histórica
         // todavía no haya podido crear todos los índices UNIQUE por duplicados antiguos.
@@ -2467,9 +2472,9 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
                 .Select(d => (d.ConsumptionKey ?? "").Trim())
                 .ToList();
             if (partialKeys.Any(string.IsNullOrWhiteSpace))
-                return Results.BadRequest(new { ok = false, message = "Un pago parcial llegó con productos sin ConsumptionKey. Se bloqueó para evitar doble cobro.", minimumClientVersion = 160 });
+                return Results.BadRequest(new { ok = false, message = "Un pago parcial llegó con productos sin ConsumptionKey. Se bloqueó para evitar doble cobro.", minimumClientVersion = 164 });
             if (partialKeys.Distinct(StringComparer.OrdinalIgnoreCase).Count() != partialKeys.Count)
-                return Results.BadRequest(new { ok = false, message = "El mismo producto aparece repetido dentro del pago parcial. Se bloqueó para evitar inflación.", minimumClientVersion = 160 });
+                return Results.BadRequest(new { ok = false, message = "El mismo producto aparece repetido dentro del pago parcial. Se bloqueó para evitar inflación.", minimumClientVersion = 164 });
         }
 
         // V48: un cierre final de sesión se contabiliza una sola vez, aunque llegue con otra OperationKey.
@@ -5857,7 +5862,7 @@ static string NormalizarCategoriaProducto(string? categoria, string? nombre)
     return "Otros";
 }
 
-static async Task<(decimal normal, decimal promoLunes, decimal privada, bool promoActiva)> EnsureTablePricingAsync(MySqlConnection con)
+static async Task<(decimal normal, decimal promoLunes, decimal privada, decimal promoPrivada, bool promoActiva)> EnsureTablePricingAsync(MySqlConnection con)
 {
     await using (var create = new MySqlCommand("""
         CREATE TABLE IF NOT EXISTS configuracion_sistema (
@@ -5878,6 +5883,7 @@ static async Task<(decimal normal, decimal promoLunes, decimal privada, bool pro
         "INSERT IGNORE INTO configuracion_sistema (clave, valor_decimal, actualizado) VALUES ('TARIFA_MESA_NORMAL', 20.00, NOW());",
         "INSERT IGNORE INTO configuracion_sistema (clave, valor_decimal, actualizado) VALUES ('TARIFA_MESA_PROMO_LUNES', 10.00, NOW());",
         "INSERT IGNORE INTO configuracion_sistema (clave, valor_decimal, actualizado) VALUES ('TARIFA_MESA_PRIVADA', 40.00, NOW());",
+        "INSERT IGNORE INTO configuracion_sistema (clave, valor_decimal, actualizado) VALUES ('TARIFA_MESA_PROMO_PRIVADA', 20.00, NOW());",
         "INSERT IGNORE INTO configuracion_sistema (clave, valor_decimal, actualizado) VALUES ('PROMO_LUNES_ACTIVA', 1.00, NOW());"
     };
     foreach (string sql in seedSql)
@@ -5906,6 +5912,8 @@ static async Task<(decimal normal, decimal promoLunes, decimal privada, bool pro
             ON DUPLICATE KEY UPDATE valor_decimal=10.00, actualizado=NOW();
             INSERT INTO configuracion_sistema (clave, valor_decimal, actualizado) VALUES ('TARIFA_MESA_PRIVADA', 40.00, NOW())
             ON DUPLICATE KEY UPDATE valor_decimal=40.00, actualizado=NOW();
+            INSERT INTO configuracion_sistema (clave, valor_decimal, actualizado) VALUES ('TARIFA_MESA_PROMO_PRIVADA', 20.00, NOW())
+            ON DUPLICATE KEY UPDATE valor_decimal=VALUES(valor_decimal), actualizado=NOW();
             INSERT INTO configuracion_sistema (clave, valor_decimal, actualizado) VALUES ('PROMO_LUNES_ACTIVA', 1.00, NOW())
             ON DUPLICATE KEY UPDATE valor_decimal=1.00, actualizado=NOW();
             INSERT INTO configuracion_sistema (clave, valor_decimal, actualizado) VALUES ('TARIFA_V54_APLICADA', 1.00, NOW())
@@ -5955,12 +5963,12 @@ static async Task<(decimal normal, decimal promoLunes, decimal privada, bool pro
         await migratePromo76.ExecuteNonQueryAsync();
     }
 
-    decimal normal = 20m, promo = 10m, privada = 40m;
+    decimal normal = 20m, promo = 10m, privada = 40m, promoPrivada = 20m;
     bool promoActiva = true;
     await using (var get = new MySqlCommand("""
         SELECT clave, valor_decimal
         FROM configuracion_sistema
-        WHERE clave IN ('TARIFA_MESA_HORA','TARIFA_MESA_NORMAL','TARIFA_MESA_PROMO_LUNES','TARIFA_MESA_PRIVADA','PROMO_LUNES_ACTIVA');
+        WHERE clave IN ('TARIFA_MESA_HORA','TARIFA_MESA_NORMAL','TARIFA_MESA_PROMO_LUNES','TARIFA_MESA_PRIVADA','TARIFA_MESA_PROMO_PRIVADA','PROMO_LUNES_ACTIVA');
     """, con))
     await using (var rd = await get.ExecuteReaderAsync())
     {
@@ -5975,6 +5983,7 @@ static async Task<(decimal normal, decimal promoLunes, decimal privada, bool pro
                 case "TARIFA_MESA_NORMAL": if (value > 0) normal = value; break;
                 case "TARIFA_MESA_PROMO_LUNES": if (value > 0) promo = value; break;
                 case "TARIFA_MESA_PRIVADA": if (value > 0) privada = value; break;
+                case "TARIFA_MESA_PROMO_PRIVADA": if (value > 0) promoPrivada = value; break;
                 case "PROMO_LUNES_ACTIVA": promoActiva = value > 0; break;
             }
         }
@@ -5987,9 +5996,11 @@ static async Task<(decimal normal, decimal promoLunes, decimal privada, bool pro
     if (normal <= 0) normal = 20m;
     if (promo <= 0) promo = 10m;
     if (privada <= 0) privada = 40m;
+    if (promoPrivada <= 0) promoPrivada = 20m;
     normal = Math.Round(normal, 2);
     promo = Math.Round(promo, 2);
     privada = Math.Round(privada, 2);
+    promoPrivada = Math.Round(promoPrivada, 2);
 
     // TARIFA_MESA_HORA queda espejada a NORMAL para clientes anteriores.
     await using (var save = new MySqlCommand("""
@@ -6018,7 +6029,7 @@ static async Task<(decimal normal, decimal promoLunes, decimal privada, bool pro
         try { await sync.ExecuteNonQueryAsync(); } catch { }
     }
 
-    return (normal, promo, privada, promoActiva);
+    return (normal, promo, privada, promoPrivada, promoActiva);
 }
 
 static int ParsePromoDate(string? value)
@@ -7385,6 +7396,7 @@ public sealed record TableRateRequest(
     decimal PrecioNormal = 0m,
     decimal PrecioPromoLunes = 10m,
     decimal PrecioPrivada = 40m,
+    decimal PrecioPromoPrivada = 20m,
     bool PromoLunesActiva = true,
     int PromoLunesSucursal = 0,
     int PromoLunesSector = 0,
