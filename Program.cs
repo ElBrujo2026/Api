@@ -1,4 +1,5 @@
-using System.Text;
+﻿using System.Text;
+using System.Text.RegularExpressions;
 using System.Text.Json;
 using System.Security.Cryptography;
 using Google.Apis.Auth.OAuth2;
@@ -96,10 +97,10 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
 app.MapGet("/api/system/version", () => Results.Ok(new
 {
     ok = true,
-    apiVersion = "V78_ANTI_DUPLICADO_VASOS_REALES",
+    apiVersion = "V79_COMBOS_CANTIDAD_AUTOMATICA",
     minimumClientVersion = 160,
     accountingMode = "LIBRO_INMUTABLE_TRANSACCIONAL",
-    message = "Caja/Admin V160 o superior. Ventas/stock idempotentes y vasos servidos descuentan de la botella de origen."
+    message = "API V79. Combos/promociones calculan disponibilidad desde sus componentes reales; conserva anti-duplicado y vasos de V78."
 }));
 
 app.MapGet("/api/sheets/status", async (SheetsReporter sheets) =>
@@ -145,7 +146,7 @@ app.MapGet("/api/sheets/debug", async (Db db, SheetsReporter sheets) =>
         return Results.Ok(new
         {
             ok = true,
-            apiVersion = "V78_ANTI_DUPLICADO_VASOS_REALES",
+            apiVersion = "V79_COMBOS_CANTIDAD_AUTOMATICA",
             googleSheetsConfigured = sheets.IsConfigured,
             googleSheetsConnected = sheetsConnection.Ok,
             googleSheetsMessage = sheetsConnection.Message,
@@ -1123,7 +1124,8 @@ app.MapGet("/api/app-mesera/productos", async (Db db, int sucursalId, string? us
     foreach (var row in rows)
     {
         string nombre = Convert.ToString(row.TryGetValue("producto", out var n) ? n : "") ?? "";
-        if (CompositeInventoryDb.IsComposite(nombre))
+        string categoria = Convert.ToString(row.TryGetValue("categoria", out var cat) ? cat : "") ?? "";
+        if (CompositeInventoryDb.IsComposite(nombre, categoria))
         {
             row["stock_actual"] = CompositeInventoryDb.AvailableSales(stockCatalog, nombre);
             row["sin_limite_stock"] = 0;
@@ -1320,18 +1322,59 @@ app.MapPost("/api/app-mesera/pedidos", async (Db db, AppPedidoMovilRequest req) 
 
     try
     {
-        bool pedidoYaExistia;
-        await using (var existePedido = new MySqlCommand("SELECT COUNT(*) FROM pedidos_movil WHERE sync_key = @sync_key;", con, tx))
+        // V78: primero se reclama la sync_key del pedido DENTRO de la transacción.
+        // El INSERT IGNORE UNIQUE ocurre ANTES de tocar stock. Si dos reintentos iguales
+        // llegan al mismo tiempo, solo uno inserta la cabecera y solo ese puede reservar inventario.
+        const string claimPedidoSql = """
+            INSERT IGNORE INTO pedidos_movil
+                (sucursal_id, sector, mesa_id, mesa, mesera_usuario, mesera_nombre, fecha, estado, total, observacion, sync_key)
+            VALUES
+                (@sucursal_id, @sector, @mesa_id, @mesa, @mesera_usuario, @mesera_nombre, NOW(), 'PENDIENTE', @total, @observacion, @sync_key);
+        """;
+        int pedidoInsertado;
+        await using (var claim = new MySqlCommand(claimPedidoSql, con, tx))
         {
-            existePedido.Parameters.AddWithValue("@sync_key", syncKey);
-            pedidoYaExistia = Convert.ToInt32(await existePedido.ExecuteScalarAsync() ?? 0) > 0;
+            claim.Parameters.AddWithValue("@sucursal_id", req.SucursalId);
+            claim.Parameters.AddWithValue("@sector", sectorPedido);
+            claim.Parameters.AddWithValue("@mesa_id", req.MesaId);
+            claim.Parameters.AddWithValue("@mesa", req.Mesa);
+            claim.Parameters.AddWithValue("@mesera_usuario", req.MeseraUsuario);
+            claim.Parameters.AddWithValue("@mesera_nombre", req.MeseraNombre);
+            claim.Parameters.AddWithValue("@total", subtotal);
+            claim.Parameters.AddWithValue("@observacion", req.Observacion ?? "");
+            claim.Parameters.AddWithValue("@sync_key", syncKey);
+            pedidoInsertado = await claim.ExecuteNonQueryAsync();
         }
 
-        // Reserva/descuenta el inventario UNA sola vez al recibir un pedido móvil nuevo.
-        // Así dos celulares no pueden vender la última unidad al mismo tiempo y el cierre de mesa
-        // no vuelve a descontar el mismo producto.
+        long pedidoId;
+        await using (var getPedido = new MySqlCommand("SELECT id FROM pedidos_movil WHERE sync_key=@sync_key LIMIT 1;", con, tx))
+        {
+            getPedido.Parameters.AddWithValue("@sync_key", syncKey);
+            pedidoId = Convert.ToInt64(await getPedido.ExecuteScalarAsync() ?? 0L);
+        }
+        if (pedidoId <= 0)
+            throw new InvalidOperationException("No se pudo asegurar la identidad única del pedido móvil.");
+
+        if (pedidoInsertado == 0)
+        {
+            await tx.CommitAsync();
+            return Results.Ok(new
+            {
+                ok = true,
+                pedido_id = pedidoId,
+                estado = "PENDIENTE",
+                sector = sectorPedido,
+                total = subtotal,
+                comision_calculada = generaComisionAplicada ? 5M * req.Cantidad : 0M,
+                inventario_aplicado = "",
+                idempotent = true,
+                message = "Pedido ya recibido anteriormente. No se volvió a descontar inventario."
+            });
+        }
+
+        // Reserva/descuenta el inventario UNA sola vez al recibir un pedido móvil NUEVO.
         string inventarioAplicado = "";
-        if (!pedidoYaExistia && esCompuesto)
+        if (esCompuesto)
         {
             var reserva = await CompositeInventoryDb.ReserveAsync(con, tx, req.SucursalId, sectorPedido, nombreCatalogo, req.Cantidad);
             if (!reserva.Ok)
@@ -1341,7 +1384,7 @@ app.MapPost("/api/app-mesera/pedidos", async (Db db, AppPedidoMovilRequest req) 
             }
             inventarioAplicado = reserva.Description;
         }
-        else if (!pedidoYaExistia && !sinLimiteStock)
+        else if (!sinLimiteStock)
         {
             await using var reservarStock = new MySqlCommand("""
                 UPDATE productos
@@ -1370,30 +1413,6 @@ app.MapPost("/api/app-mesera/pedidos", async (Db db, AppPedidoMovilRequest req) 
                 });
             }
         }
-
-        const string pedidoSql = """
-            INSERT INTO pedidos_movil
-                (sucursal_id, sector, mesa_id, mesa, mesera_usuario, mesera_nombre, fecha, estado, total, observacion, sync_key)
-            VALUES
-                (@sucursal_id, @sector, @mesa_id, @mesa, @mesera_usuario, @mesera_nombre, NOW(), 'PENDIENTE', @total, @observacion, @sync_key)
-            ON DUPLICATE KEY UPDATE
-                total = VALUES(total),
-                observacion = VALUES(observacion);
-            SELECT id FROM pedidos_movil WHERE sync_key = @sync_key LIMIT 1;
-        """;
-
-        await using var pedidoCmd = new MySqlCommand(pedidoSql, con, tx);
-        pedidoCmd.Parameters.AddWithValue("@sucursal_id", req.SucursalId);
-        pedidoCmd.Parameters.AddWithValue("@sector", sectorPedido);
-        pedidoCmd.Parameters.AddWithValue("@mesa_id", req.MesaId);
-        pedidoCmd.Parameters.AddWithValue("@mesa", req.Mesa);
-        pedidoCmd.Parameters.AddWithValue("@mesera_usuario", req.MeseraUsuario);
-        pedidoCmd.Parameters.AddWithValue("@mesera_nombre", req.MeseraNombre);
-        pedidoCmd.Parameters.AddWithValue("@total", subtotal);
-        pedidoCmd.Parameters.AddWithValue("@observacion", req.Observacion ?? "");
-        pedidoCmd.Parameters.AddWithValue("@sync_key", syncKey);
-
-        long pedidoId = Convert.ToInt64(await pedidoCmd.ExecuteScalarAsync());
 
         await using (var del = new MySqlCommand("DELETE FROM detalle_pedidos_movil WHERE pedido_id = @pedido_id;", con, tx))
         {
@@ -3732,9 +3751,13 @@ app.MapPost("/api/admin/inventario/consulta", async (Db db, AdminInventoryQueryR
                COALESCE(SUM(CASE WHEN m.delta>0 AND m.sector='ABAJO' THEN m.delta ELSE 0 END),0) AS entradas_abajo,
                COALESCE(SUM(CASE WHEN m.delta>0 AND UPPER(COALESCE(m.motivo,'')) NOT LIKE 'TRANSFERENCIA%' THEN m.delta ELSE 0 END),0) AS entradas_total,
                MAX(p.stock_minimo) AS stock_minimo,
-               MAX(COALESCE(p.sin_limite_stock,0)) AS sin_limite_stock
+               MAX(COALESCE(p.sin_limite_stock,0)) AS sin_limite_stock,
+               MAX(COALESCE(p.rendimiento_vaso,10)) AS rendimiento_vaso,
+               MAX(CASE WHEN p.sector='ARRIBA' THEN COALESCE(vc.servicios_restantes,0) ELSE 0 END) AS vasos_abiertos_arriba,
+               MAX(CASE WHEN p.sector='ABAJO' THEN COALESCE(vc.servicios_restantes,0) ELSE 0 END) AS vasos_abiertos_abajo
         FROM productos p
         LEFT JOIN movimientos_inventario_admin m ON m.producto_id=p.id AND m.sucursal_id=p.sucursal_id
+        LEFT JOIN vaso_control vc ON vc.sucursal_id=p.sucursal_id AND vc.sector=p.sector AND vc.producto_id=p.id
         WHERE p.sucursal_id=2 AND p.estado='ACTIVO' AND p.sector IN ('ARRIBA','ABAJO')
         GROUP BY LOWER(TRIM(p.nombre))
         ORDER BY categoria, producto;
@@ -3742,11 +3765,14 @@ app.MapPost("/api/admin/inventario/consulta", async (Db db, AdminInventoryQueryR
         SELECT p.nombre AS producto,p.categoria,p.unidad_base,
                p.stock_actual AS stock_actual,
                COALESCE(SUM(CASE WHEN m.delta>0 THEN m.delta ELSE 0 END),0) AS entradas_total,
-               p.stock_minimo,COALESCE(p.sin_limite_stock,0) AS sin_limite_stock
+               p.stock_minimo,COALESCE(p.sin_limite_stock,0) AS sin_limite_stock,
+               COALESCE(p.rendimiento_vaso,10) AS rendimiento_vaso,
+               COALESCE(vc.servicios_restantes,0) AS vasos_abiertos
         FROM productos p
         LEFT JOIN movimientos_inventario_admin m ON m.producto_id=p.id AND m.sucursal_id=p.sucursal_id
+        LEFT JOIN vaso_control vc ON vc.sucursal_id=p.sucursal_id AND vc.sector=p.sector AND vc.producto_id=p.id
         WHERE p.sucursal_id=1 AND p.estado='ACTIVO' AND p.sector='GENERAL'
-        GROUP BY p.id,p.nombre,p.categoria,p.unidad_base,p.stock_actual,p.stock_minimo,p.sin_limite_stock
+        GROUP BY p.id,p.nombre,p.categoria,p.unidad_base,p.stock_actual,p.stock_minimo,p.sin_limite_stock,p.rendimiento_vaso,vc.servicios_restantes
         ORDER BY p.categoria,p.nombre;
     """;
     var items = await db.QueryAsync(con, sql);
@@ -7558,6 +7584,7 @@ public static class CompositeInventoryDb
         public decimal Stock { get; set; }
         public bool Unlimited { get; set; }
         public int GlassYield { get; set; } = 10;
+        public string RecipeDetail { get; set; } = "";
     }
 
     public sealed class StockPart
@@ -7584,13 +7611,14 @@ public static class CompositeInventoryDb
                n == "VASO CHUFLAY";
     }
 
-    public static bool IsComposite(string? productName)
+    public static bool IsComposite(string? productName, string? category = null)
     {
         string n = N(productName);
-        if (IsServedGlassName(productName)) return true;
-        if (!(n.StartsWith("COMBO ") || n.StartsWith("PROMO "))) return false;
-        return n.Contains("FERNET") || n.Contains("FLOR DE CANA") || n.Contains("HABANA") || n.Contains("HAVANA") || n.Contains("GIN") ||
-               n.Contains("AMSTEL") || n.Contains("CONTI") || n.Contains("CORONA") || n.Contains("PACENA") || n.Contains("RON ABUELO");
+        string c = N(category);
+        if (IsServedGlassName(productName, category)) return true;
+        // V79: cualquier producto categorizado/nombre COMBO o PROMO es compuesto.
+        return n.StartsWith("COMBO ") || n.StartsWith("PROMO ") ||
+               c == "COMBO" || c == "PROMO" || c == "PROMOCION" || c.Contains("COMBOS / PROMOS");
     }
 
     static decimal Qty(StockProduct? p) => p == null ? 0M : (p.Unlimited ? 1000000000M : Math.Max(0M, p.Stock));
@@ -7619,6 +7647,147 @@ public static class CompositeInventoryDb
                 (N(x.Name).Contains("COCA") || N(x.Name).Contains("FANTA") || N(x.Name).Contains("SPRITE")))
             .OrderByDescending(Qty).ThenBy(x => x.Name).ToList();
 
+    sealed class RecipeNeed
+    {
+        public decimal Units { get; set; } = 1M;
+        public string Label { get; set; } = "";
+        public bool SodaPool { get; set; }
+    }
+
+    static List<RecipeNeed> ParseRecipe(string? detail)
+    {
+        var result = new List<RecipeNeed>();
+        string raw = (detail ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(raw)) return result;
+        foreach (string piece in Regex.Split(raw, @"\s*(?:\+|;|\r?\n)\s*"))
+        {
+            string part = piece.Trim();
+            if (string.IsNullOrWhiteSpace(part)) continue;
+            Match m = Regex.Match(part, @"^\s*(\d+(?:[\.,]\d+)?)\s*[xX×]\s*(.+?)\s*$");
+            if (!m.Success) continue;
+            decimal units = decimal.TryParse(m.Groups[1].Value.Replace(',', '.'), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out decimal q) ? Math.Max(1M, q) : 1M;
+            string label = m.Groups[2].Value.Trim();
+            if (string.IsNullOrWhiteSpace(label)) continue;
+            string nl = N(label);
+            bool sodaPool = nl.Contains("SODA") &&
+                (nl.Contains("COCA") || nl.Contains("FANTA") || nl.Contains("SPRITE") || nl == "SODA" || nl.Contains("GASEOSA"));
+            result.Add(new RecipeNeed { Units = units, Label = label, SodaPool = sodaPool });
+        }
+        return result;
+    }
+
+    static StockProduct? FindRecipeProduct(List<StockProduct> all, string label)
+    {
+        string target = N(label);
+        StockProduct? exact = all.FirstOrDefault(x => N(x.Name) == target);
+        if (exact != null) return exact;
+        StockProduct? contains = all.FirstOrDefault(x => N(x.Name).Contains(target) || target.Contains(N(x.Name)));
+        if (contains != null) return contains;
+        string[] words = target.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .Where(w => w.Length >= 3 && w is not "SODA" and not "CERVEZA" and not "BOTELLA" and not "LITROS" and not "LITRO")
+            .ToArray();
+        if (words.Length == 0) return null;
+        return all.Select(x => new { Product = x, Score = words.Count(w => N(x.Name).Contains(w)) })
+            .Where(x => x.Score > 0).OrderByDescending(x => x.Score).ThenBy(x => x.Product.Name)
+            .Select(x => x.Product).FirstOrDefault();
+    }
+
+    static bool TryRecipeAvailability(List<StockProduct> all, StockProduct parent, out decimal available)
+    {
+        available = 0M;
+        List<RecipeNeed> recipe = ParseRecipe(parent.RecipeDetail);
+        if (recipe.Count == 0) return false;
+        decimal max = decimal.MaxValue;
+        foreach (RecipeNeed need in recipe)
+        {
+            decimal possible;
+            if (need.SodaPool)
+            {
+                decimal total = Sodas(all).Sum(Qty);
+                possible = Math.Floor(total / Math.Max(1M, need.Units));
+            }
+            else
+            {
+                StockProduct? component = FindRecipeProduct(all.Where(x => x.Id != parent.Id && !IsComposite(x.Name, x.Category)).ToList(), need.Label);
+                if (component == null) { available = 0M; return true; }
+                possible = Math.Floor(Qty(component) / Math.Max(1M, need.Units));
+            }
+            max = Math.Min(max, possible);
+        }
+        available = max == decimal.MaxValue ? 0M : Math.Max(0M, max);
+        return true;
+    }
+
+    static bool TryRecipeDescribe(List<StockProduct> all, StockProduct parent, out string description)
+    {
+        description = "";
+        List<RecipeNeed> recipe = ParseRecipe(parent.RecipeDetail);
+        if (recipe.Count == 0) return false;
+        var parts = new List<string>();
+        List<StockProduct> physical = all.Where(x => x.Id != parent.Id && !IsComposite(x.Name, x.Category)).ToList();
+        foreach (RecipeNeed need in recipe)
+        {
+            if (need.SodaPool)
+            {
+                string sodas = string.Join(", ", Sodas(physical).Where(x => Qty(x) > 0).Select(x => x.Name));
+                parts.Add(need.Units.ToString("0.##") + "x soda disponible: " + (string.IsNullOrWhiteSpace(sodas) ? "AGOTADA" : sodas));
+            }
+            else
+            {
+                StockProduct? component = FindRecipeProduct(physical, need.Label);
+                parts.Add(need.Units.ToString("0.##") + "x " + (component?.Name ?? (need.Label + " (NO ENCONTRADO)")));
+            }
+        }
+        description = string.Join(" + ", parts);
+        return true;
+    }
+
+    static bool TryAllocateRecipe(List<StockProduct> all, StockProduct parent, decimal saleQty, out List<StockPart> parts, out string error)
+    {
+        parts = new List<StockPart>();
+        error = "";
+        List<RecipeNeed> recipe = ParseRecipe(parent.RecipeDetail);
+        if (recipe.Count == 0) return false;
+        List<StockProduct> physical = all.Where(x => x.Id != parent.Id && !IsComposite(x.Name, x.Category)).ToList();
+
+        foreach (RecipeNeed need in recipe)
+        {
+            decimal required = Math.Max(1M, need.Units) * Math.Max(1M, saleQty);
+            if (need.SodaPool)
+            {
+                decimal remain = required;
+                foreach (StockProduct soda in Sodas(physical))
+                {
+                    if (remain <= 0) break;
+                    decimal take = Math.Min(remain, soda.Unlimited ? remain : Qty(soda));
+                    if (take > 0) { parts.Add(new StockPart { ProductId = soda.Id, ProductName = soda.Name, Units = take }); remain -= take; }
+                }
+                if (remain > 0) { error = "No hay soda suficiente para armar " + parent.Name + "."; return true; }
+            }
+            else
+            {
+                StockProduct? component = FindRecipeProduct(physical, need.Label);
+                if (component == null) { error = "No se encontró el componente '" + need.Label + "' en el catálogo actual."; return true; }
+                parts.Add(new StockPart { ProductId = component.Id, ProductName = component.Name, Units = required });
+            }
+        }
+
+        parts = parts.GroupBy(x => x.ProductId)
+            .Select(g => new StockPart { ProductId = g.Key, ProductName = g.First().ProductName, Units = g.Sum(x => x.Units) })
+            .ToList();
+        foreach (StockPart part in parts)
+        {
+            StockProduct? p = all.FirstOrDefault(x => x.Id == part.ProductId);
+            if (p == null) { error = "Producto componente no encontrado."; return true; }
+            if (!p.Unlimited && p.Stock < part.Units)
+            {
+                error = "Inventario insuficiente: " + p.Name + ". Disponible: " + p.Stock + ", requerido: " + part.Units + ".";
+                return true;
+            }
+        }
+        return true;
+    }
+
     static int BeerUnits(string productName)
     {
         string n = N(productName);
@@ -7638,7 +7807,8 @@ public static class CompositeInventoryDb
     {
         string sql = """
             SELECT id, nombre, categoria, stock_actual, COALESCE(sin_limite_stock,0) AS sin_limite_stock,
-                   COALESCE(rendimiento_vaso,10) AS rendimiento_vaso
+                   COALESCE(rendimiento_vaso,10) AS rendimiento_vaso,
+                   COALESCE((SELECT pr.nombre FROM presentaciones pr WHERE pr.producto_id=productos.id AND pr.estado='ACTIVO' ORDER BY pr.id LIMIT 1),'') AS recipe_detail
             FROM productos
             WHERE sucursal_id=@sucursal_id AND sector=@sector AND estado='ACTIVO'
             ORDER BY id
@@ -7657,7 +7827,8 @@ public static class CompositeInventoryDb
                 Category = rd.IsDBNull(2) ? "" : rd.GetString(2),
                 Stock = rd.IsDBNull(3) ? 0M : rd.GetDecimal(3),
                 Unlimited = !rd.IsDBNull(4) && rd.GetInt32(4) == 1,
-                GlassYield = rd.IsDBNull(5) ? 10 : Math.Max(1, rd.GetInt32(5))
+                GlassYield = rd.IsDBNull(5) ? 10 : Math.Max(1, rd.GetInt32(5)),
+                RecipeDetail = rd.IsDBNull(6) ? "" : rd.GetString(6)
             });
         }
         return result;
@@ -7667,7 +7838,7 @@ public static class CompositeInventoryDb
     {
         // Solo una botella física puede ser origen de un vaso servido.
         // Evita que "VASO FERNET" termine encontrándose a sí mismo si falta FERNET.
-        List<StockProduct> physical = all.Where(x => !IsComposite(x.Name)).ToList();
+        List<StockProduct> physical = all.Where(x => !IsComposite(x.Name, x.Category)).ToList();
         string n = N(servedName);
         baseProduct = null;
         if (n.Contains("FERNET")) baseProduct = FindOne(physical, "FERNET");
@@ -7683,16 +7854,16 @@ public static class CompositeInventoryDb
 
     public static decimal AvailableSales(List<StockProduct> all, string productName)
     {
-        if (IsServedGlassName(productName))
+        StockProduct? own = FindOne(all, productName);
+        if (IsServedGlassName(productName, own?.Category))
         {
             if (!TryGlassBase(all, productName, out StockProduct? b) || b == null) return 0M;
             return b.Unlimited ? 1000000000M : Math.Floor(Qty(b) * Math.Max(1, b.GlassYield));
         }
-        if (!IsComposite(productName))
-        {
-            StockProduct? own = FindOne(all, productName);
+        if (!IsComposite(productName, own?.Category))
             return Qty(own);
-        }
+
+        if (own != null && TryRecipeAvailability(all, own, out decimal recipeAvailable)) return recipeAvailable;
 
         string n = N(productName);
         if (n.StartsWith("COMBO "))
@@ -7738,12 +7909,14 @@ public static class CompositeInventoryDb
     public static string DescribeAvailable(List<StockProduct> all, string productName)
     {
         string n = N(productName);
-        if (IsServedGlassName(productName))
+        StockProduct? own = FindOne(all, productName);
+        if (IsServedGlassName(productName, own?.Category))
         {
             if (!TryGlassBase(all, productName, out StockProduct? b) || b == null) return "Falta configurar la botella de origen";
             return b.Name + " · " + Math.Max(1, b.GlassYield) + " vasos por botella";
         }
-        if (!IsComposite(productName)) return productName;
+        if (!IsComposite(productName, own?.Category)) return productName;
+        if (own != null && TryRecipeDescribe(all, own, out string recipeDescription)) return recipeDescription;
         if (n.StartsWith("COMBO "))
         {
             if (n.Contains("GIN")) return "GIN ROSADO + SANTE GRANDE";
@@ -7768,6 +7941,17 @@ public static class CompositeInventoryDb
         error = "";
         saleQty = Math.Max(1M, saleQty);
         string n = N(productName);
+
+        StockProduct? parent = FindOne(all, productName);
+        if (parent != null && IsComposite(productName, parent.Category) && !IsServedGlassName(productName, parent.Category))
+        {
+            bool handled = TryAllocateRecipe(all, parent, saleQty, out List<StockPart> recipeParts, out error);
+            if (handled)
+            {
+                parts = recipeParts;
+                return string.IsNullOrWhiteSpace(error);
+            }
+        }
 
         void Need(StockProduct? p, decimal units, string label)
         {
