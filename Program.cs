@@ -78,7 +78,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
         return Results.Ok(new
         {
             ok = true,
-            version = "V76_STOCK_SECTOR_MESAS_DINAMICAS",
+            version = "V77_FIX_COMPILACION_STOCK_SECTOR",
             database,
             mysql = "conectado",
             googleSheets = sheets.IsConfigured ? "configurado" : "faltan variables GOOGLE_SHEET_ID y GOOGLE_CREDENTIALS_JSON",
@@ -96,7 +96,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
 app.MapGet("/api/system/version", () => Results.Ok(new
 {
     ok = true,
-    apiVersion = "V76_STOCK_SECTOR_MESAS_DINAMICAS",
+    apiVersion = "V77_FIX_COMPILACION_STOCK_SECTOR",
     minimumClientVersion = 159,
     accountingMode = "LIBRO_INMUTABLE_TRANSACCIONAL",
     message = "Caja/Admin V159 o superior. PREMIU usa un catálogo común con stock separado ARRIBA/ABAJO y mesas configurables por sector."
@@ -1472,7 +1472,7 @@ app.MapPost("/api/app-mesera/reportes-producto", async (Db db, ProductReportRequ
             stockCmd.Parameters.AddWithValue("@unidades", unidades);
             stockCmd.Parameters.AddWithValue("@producto_id", req.ProductoId);
             stockCmd.Parameters.AddWithValue("@sucursal_id", sucursalId);
-            stockCmd.Parameters.AddWithValue("@sector", NormalizarSectorProducto(sucursalId, sector));
+            stockCmd.Parameters.AddWithValue("@sector", NormalizarSectorProducto(sucursalId, sectorReporte));
             await stockCmd.ExecuteNonQueryAsync();
         }
 
@@ -7449,7 +7449,7 @@ public record UserEstadoRequest(string Estado);
 
 // V66: inventario real para combos/promociones.
 // Los combos no usan un stock ficticio propio: descuentan los productos físicos disponibles
-// en la misma sucursal. ARRIBA/ABAJO comparten stock; las sodas se toman del catálogo activo (Coca-Cola/Fanta/Sprite).
+// en la misma sucursal y sector. En PREMIU el catálogo es común, pero ARRIBA/ABAJO tienen existencias separadas.
 public static class CompositeInventoryDb
 {
     public sealed class StockProduct
@@ -7512,6 +7512,15 @@ public static class CompositeInventoryDb
         return n.Contains("X 3") || n.EndsWith(" X3") ? 3 : 5;
     }
 
+    static string NormalizarSectorProductoInterno(int sucursalId, string? sector)
+    {
+        if (sucursalId != 2) return "GENERAL";
+        string raw = (sector ?? "").Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(raw) || raw == "GENERAL" || raw.Contains("COMPARTIDO")) return "ABAJO";
+        if (raw.Contains("ABAJO") || raw.Contains("BAJO") || raw.Contains("CAJA 2")) return "ABAJO";
+        return "ARRIBA";
+    }
+
     public static async Task<List<StockProduct>> LoadSnapshotAsync(MySqlConnection con, int sucursalId, string sector, MySqlTransaction? tx = null, bool forUpdate = false)
     {
         string sql = """
@@ -7522,7 +7531,7 @@ public static class CompositeInventoryDb
             """ + (forUpdate ? " FOR UPDATE;" : ";");
         await using var cmd = tx == null ? new MySqlCommand(sql, con) : new MySqlCommand(sql, con, tx);
         cmd.Parameters.AddWithValue("@sucursal_id", sucursalId);
-        cmd.Parameters.AddWithValue("@sector", NormalizarSectorProducto(sucursalId, sector));
+        cmd.Parameters.AddWithValue("@sector", NormalizarSectorProductoInterno(sucursalId, sector));
         List<StockProduct> result = new();
         await using var rd = await cmd.ExecuteReaderAsync();
         while (await rd.ReadAsync())

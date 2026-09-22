@@ -1,6 +1,6 @@
-# BILLAR EL BRUJO API V73
+# BILLAR EL BRUJO API V77
 
-API central para Caja/Admin V157 y App Mesera V18.
+API central para Caja/Admin V159, App Mesera V19 y App Admin Android V3.
 
 ## Google Sheets
 - Conexión real verificable con `/api/sheets/test`.
