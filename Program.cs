@@ -41,6 +41,7 @@ try
     await EnsureMesasEnVivoTables(startupCon);
     await EnsureOfficialBranchAndTableLayout(startupCon);
     await EnsureTablePricingAsync(startupCon);
+    await EnsureTablePromotionScopeAsync(startupCon);
     await EnsureTableLayoutSettingsAsync(startupCon);
     await EnsureVentaSyncProtection(startupCon);
     await EnsureAccountingLedger(startupCon);
@@ -98,9 +99,9 @@ app.MapGet("/api/system/version", () => Results.Ok(new
 {
     ok = true,
     apiVersion = "V79_COMBOS_CANTIDAD_AUTOMATICA",
-    minimumClientVersion = 160,
+    minimumClientVersion = 163,
     accountingMode = "LIBRO_INMUTABLE_TRANSACCIONAL",
-    message = "API V79. Combos/promociones calculan disponibilidad desde sus componentes reales; conserva anti-duplicado y vasos de V78."
+    message = "API V80. Promoción 2x1 configurable por sucursal/sector/fechas; conserva combos, anti-duplicado y vasos."
 }));
 
 app.MapGet("/api/sheets/status", async (SheetsReporter sheets) =>
@@ -1824,6 +1825,7 @@ app.MapGet("/api/config/tarifa-mesas", async (Db db) =>
 {
     await using var con = await db.OpenAsync();
     var pricing = await EnsureTablePricingAsync(con);
+    var promoScope = await EnsureTablePromotionScopeAsync(con);
     return Results.Ok(new
     {
         ok = true,
@@ -1832,7 +1834,14 @@ app.MapGet("/api/config/tarifa-mesas", async (Db db) =>
         precioNormal = pricing.normal,
         precioPromoLunes = pricing.promoLunes,
         precioPrivada = pricing.privada,
-        promoLunesActiva = pricing.promoActiva
+        promoLunesActiva = pricing.promoActiva,
+        promoLunesSucursal = promoScope.mondayBranch,
+        promoLunesSector = promoScope.mondaySector,
+        promoTemporalActiva = promoScope.tempEnabled,
+        promoTemporalDesde = PromoDateText(promoScope.tempStart),
+        promoTemporalHasta = PromoDateText(promoScope.tempEnd),
+        promoTemporalSucursal = promoScope.tempBranch,
+        promoTemporalSector = promoScope.tempSector
     });
 });
 
@@ -1853,6 +1862,18 @@ app.MapPost("/api/admin/tarifa-mesas", async (Db db, string clave, TableRateRequ
 
     await using var con = await db.OpenAsync();
     await EnsureTablePricingAsync(con);
+    await EnsureTablePromotionScopeAsync(con);
+
+    int mondayBranch = Math.Clamp(req.PromoLunesSucursal, 0, 2);
+    int mondaySector = Math.Clamp(req.PromoLunesSector, 0, 2);
+    int tempBranch = Math.Clamp(req.PromoTemporalSucursal, 0, 2);
+    int tempSector = Math.Clamp(req.PromoTemporalSector, 0, 2);
+    int tempStart = ParsePromoDate(req.PromoTemporalDesde);
+    int tempEnd = ParsePromoDate(req.PromoTemporalHasta);
+    if (req.PromoTemporalActiva && (tempStart <= 0 || tempEnd <= 0))
+        return Results.BadRequest(new { ok = false, message = "La promoción temporal requiere fecha Desde y Hasta válidas." });
+    if (tempStart > 0 && tempEnd > 0 && tempEnd < tempStart)
+        (tempStart, tempEnd) = (tempEnd, tempStart);
 
     await using var tx = await con.BeginTransactionAsync();
     try
@@ -1874,6 +1895,13 @@ app.MapPost("/api/admin/tarifa-mesas", async (Db db, string clave, TableRateRequ
         await SaveValue("TARIFA_MESA_PROMO_LUNES", promo);
         await SaveValue("TARIFA_MESA_PRIVADA", privada);
         await SaveValue("PROMO_LUNES_ACTIVA", req.PromoLunesActiva ? 1m : 0m);
+        await SaveValue("PROMO_LUNES_SUCURSAL", mondayBranch);
+        await SaveValue("PROMO_LUNES_SECTOR", mondaySector);
+        await SaveValue("PROMO_TEMPORAL_ACTIVA", req.PromoTemporalActiva ? 1m : 0m);
+        await SaveValue("PROMO_TEMPORAL_DESDE", tempStart);
+        await SaveValue("PROMO_TEMPORAL_HASTA", tempEnd);
+        await SaveValue("PROMO_TEMPORAL_SUCURSAL", tempBranch);
+        await SaveValue("PROMO_TEMPORAL_SECTOR", tempSector);
 
         await using (var mesas = new MySqlCommand("""
             UPDATE mesas
@@ -1904,7 +1932,14 @@ app.MapPost("/api/admin/tarifa-mesas", async (Db db, string clave, TableRateRequ
         precioPromoLunes = promo,
         precioPrivada = privada,
         promoLunesActiva = req.PromoLunesActiva,
-        message = "Precios guardados. La promo se aplica solo al iniciar una mesa en lunes; las sesiones abiertas conservan su tarifa original."
+        promoLunesSucursal = mondayBranch,
+        promoLunesSector = mondaySector,
+        promoTemporalActiva = req.PromoTemporalActiva,
+        promoTemporalDesde = PromoDateText(tempStart),
+        promoTemporalHasta = PromoDateText(tempEnd),
+        promoTemporalSucursal = tempBranch,
+        promoTemporalSector = tempSector,
+        message = "Precios/promociones guardados. Se aplican solo a mesas NORMALES al iniciar; las sesiones abiertas conservan su tarifa original."
     });
 });
 
@@ -5986,6 +6021,63 @@ static async Task<(decimal normal, decimal promoLunes, decimal privada, bool pro
     return (normal, promo, privada, promoActiva);
 }
 
+static int ParsePromoDate(string? value)
+{
+    if (DateTime.TryParse(value, out DateTime d))
+        return d.Year * 10000 + d.Month * 100 + d.Day;
+    return 0;
+}
+
+static string PromoDateText(int yyyymmdd)
+{
+    if (yyyymmdd <= 0) return "";
+    int y = yyyymmdd / 10000;
+    int m = (yyyymmdd / 100) % 100;
+    int d = yyyymmdd % 100;
+    try { return new DateTime(y, m, d).ToString("yyyy-MM-dd"); } catch { return ""; }
+}
+
+static async Task<(int mondayBranch, int mondaySector, bool tempEnabled, int tempStart, int tempEnd, int tempBranch, int tempSector)> EnsureTablePromotionScopeAsync(MySqlConnection con)
+{
+    // Usa la misma tabla numérica de configuración para no cambiar ni migrar ventas/inventario.
+    string[] seeds =
+    {
+        "INSERT IGNORE INTO configuracion_sistema(clave,valor_decimal,actualizado) VALUES('PROMO_LUNES_SUCURSAL',0,NOW());",
+        "INSERT IGNORE INTO configuracion_sistema(clave,valor_decimal,actualizado) VALUES('PROMO_LUNES_SECTOR',0,NOW());",
+        "INSERT IGNORE INTO configuracion_sistema(clave,valor_decimal,actualizado) VALUES('PROMO_TEMPORAL_ACTIVA',0,NOW());",
+        "INSERT IGNORE INTO configuracion_sistema(clave,valor_decimal,actualizado) VALUES('PROMO_TEMPORAL_DESDE',0,NOW());",
+        "INSERT IGNORE INTO configuracion_sistema(clave,valor_decimal,actualizado) VALUES('PROMO_TEMPORAL_HASTA',0,NOW());",
+        "INSERT IGNORE INTO configuracion_sistema(clave,valor_decimal,actualizado) VALUES('PROMO_TEMPORAL_SUCURSAL',0,NOW());",
+        "INSERT IGNORE INTO configuracion_sistema(clave,valor_decimal,actualizado) VALUES('PROMO_TEMPORAL_SECTOR',0,NOW());"
+    };
+    foreach (string sql in seeds) await new MySqlCommand(sql, con).ExecuteNonQueryAsync();
+
+    int mondayBranch=0, mondaySector=0, tempStart=0, tempEnd=0, tempBranch=0, tempSector=0;
+    bool tempEnabled=false;
+    await using var cmd = new MySqlCommand("""
+        SELECT clave,valor_decimal FROM configuracion_sistema
+        WHERE clave IN ('PROMO_LUNES_SUCURSAL','PROMO_LUNES_SECTOR','PROMO_TEMPORAL_ACTIVA',
+                        'PROMO_TEMPORAL_DESDE','PROMO_TEMPORAL_HASTA','PROMO_TEMPORAL_SUCURSAL','PROMO_TEMPORAL_SECTOR');
+    """, con);
+    await using var rd = await cmd.ExecuteReaderAsync();
+    while (await rd.ReadAsync())
+    {
+        string k = rd.IsDBNull(0) ? "" : rd.GetString(0);
+        int v = rd.IsDBNull(1) ? 0 : (int)Math.Round(rd.GetDecimal(1));
+        switch(k)
+        {
+            case "PROMO_LUNES_SUCURSAL": mondayBranch=Math.Clamp(v,0,2); break;
+            case "PROMO_LUNES_SECTOR": mondaySector=Math.Clamp(v,0,2); break;
+            case "PROMO_TEMPORAL_ACTIVA": tempEnabled=v>0; break;
+            case "PROMO_TEMPORAL_DESDE": tempStart=v; break;
+            case "PROMO_TEMPORAL_HASTA": tempEnd=v; break;
+            case "PROMO_TEMPORAL_SUCURSAL": tempBranch=Math.Clamp(v,0,2); break;
+            case "PROMO_TEMPORAL_SECTOR": tempSector=Math.Clamp(v,0,2); break;
+        }
+    }
+    return (mondayBranch,mondaySector,tempEnabled,tempStart,tempEnd,tempBranch,tempSector);
+}
+
 static async Task<decimal> EnsureGlobalTableRateAsync(MySqlConnection con)
 {
     var pricing = await EnsureTablePricingAsync(con);
@@ -7293,7 +7385,14 @@ public sealed record TableRateRequest(
     decimal PrecioNormal = 0m,
     decimal PrecioPromoLunes = 10m,
     decimal PrecioPrivada = 40m,
-    bool PromoLunesActiva = true
+    bool PromoLunesActiva = true,
+    int PromoLunesSucursal = 0,
+    int PromoLunesSector = 0,
+    bool PromoTemporalActiva = false,
+    string? PromoTemporalDesde = null,
+    string? PromoTemporalHasta = null,
+    int PromoTemporalSucursal = 0,
+    int PromoTemporalSector = 0
 );
 
 public record MesaConsumoVivoRequest(
