@@ -75,7 +75,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
         return Results.Ok(new
         {
             ok = true,
-            version = "V74_PREMIU_MESAS_SECTOR_CAJA",
+            version = "V75_APP_ADMIN_REPORTES",
             database,
             mysql = "conectado",
             googleSheets = sheets.IsConfigured ? "configurado" : "faltan variables GOOGLE_SHEET_ID y GOOGLE_CREDENTIALS_JSON",
@@ -3366,6 +3366,205 @@ app.MapGet("/api/admin/cierres-turno", async (Db db, string clave, int? sucursal
     return Results.Ok(rows);
 });
 
+
+// V75: consulta segura para la APP ADMIN remota.
+// Lee ventas canónicas y arqueos de Railway; no depende de Google Sheets.
+app.MapPost("/api/admin/reportes/consulta", async (Db db, AdminReportQueryRequest req) =>
+{
+    await using var con = await db.OpenAsync();
+    await EnsureVentaSyncProtection(con);
+    await EnsureShiftCloseTables(con);
+
+    if (!await ValidarAdministradorAsync(con, req.Usuario, req.Clave))
+        return Results.Unauthorized();
+
+    int sucursalId = req.SucursalId == 2 ? 2 : 1;
+    DateTime desde = (req.Desde ?? DateTime.Today.AddDays(-7)).Date;
+    DateTime hasta = (req.Hasta ?? DateTime.Today).Date;
+    if (hasta < desde) (desde, hasta) = (hasta, desde);
+    if ((hasta - desde).TotalDays > 370)
+        return Results.BadRequest(new { ok=false, message="El rango máximo permitido es de 370 días." });
+
+    string turno = NormalizarFiltroTurno(req.Turno);
+    string sector = NormalizarFiltroSector(sucursalId, req.Sector);
+
+    var pars = new Dictionary<string, object?>
+    {
+        ["@sucursal_id"] = sucursalId,
+        ["@desde"] = desde,
+        ["@hasta"] = hasta,
+        ["@turno"] = turno,
+        ["@sector"] = sector
+    };
+
+    // Una fila por producto. Totales y medios de pago aparecen solo en la primera
+    // línea de cada venta para que Excel se pueda sumar sin inflar el dinero.
+    string ventasSql = """
+        SELECT z.id_venta, z.fecha_turno, z.turno, z.fecha, z.hora, z.cajero, z.caja, z.sector,
+               z.tipo, z.mesa, z.mesera, z.tiempo_mesa,
+               z.producto, z.presentacion, z.cantidad, z.precio_unitario, z.subtotal_producto,
+               CASE WHEN z.linea_venta=1 THEN z.costo_tiempo_base ELSE 0 END AS costo_tiempo,
+               CASE WHEN z.linea_venta=1 THEN z.ajuste_redondeo_base ELSE 0 END AS ajuste_redondeo,
+               z.subtotal_producto
+                 + CASE WHEN z.linea_venta=1 THEN z.costo_tiempo_base ELSE 0 END
+                 + CASE WHEN z.linea_venta=1 THEN z.ajuste_redondeo_base ELSE 0 END AS total_linea,
+               z.metodo_pago,
+               CASE WHEN z.linea_venta=1 THEN z.efectivo ELSE 0 END AS efectivo,
+               CASE WHEN z.linea_venta=1 THEN z.qr ELSE 0 END AS qr,
+               CASE WHEN z.linea_venta=1 THEN z.transferencia ELSE 0 END AS transferencia,
+               CASE WHEN z.linea_venta=1 THEN z.total ELSE 0 END AS total_venta,
+               z.sync_key
+        FROM (
+            SELECT v.id AS id_venta,
+                   CASE
+                       WHEN UPPER(COALESCE(NULLIF(v.turno,''), CASE WHEN TIME(v.fecha) >= '08:00:00' AND TIME(v.fecha) < '20:00:00' THEN 'MAÑANA' ELSE 'NOCHE' END)) = 'NOCHE'
+                            AND TIME(v.fecha) < '20:00:00'
+                           THEN DATE(DATE_SUB(v.fecha, INTERVAL 1 DAY))
+                       ELSE DATE(v.fecha)
+                   END AS fecha_turno,
+                   COALESCE(NULLIF(v.turno,''), CASE WHEN TIME(v.fecha) >= '08:00:00' AND TIME(v.fecha) < '20:00:00' THEN 'MAÑANA' ELSE 'NOCHE' END) AS turno,
+                   DATE(v.fecha) AS fecha,
+                   TIME(v.fecha) AS hora,
+                   v.cajero,
+                   CASE
+                       WHEN v.sucursal_id=1 THEN 'CAJA ÚNICA'
+                       WHEN UPPER(COALESCE(NULLIF(v.caja_nombre,''),u.caja_nombre,'')) IN ('CAJA 2','CAJA ABAJO') THEN 'CAJA ABAJO'
+                       WHEN UPPER(COALESCE(NULLIF(v.caja_nombre,''),u.caja_nombre,'')) IN ('CAJA 1','CAJA ARRIBA') THEN 'CAJA ARRIBA'
+                       ELSE COALESCE(NULLIF(v.caja_nombre,''),NULLIF(u.caja_nombre,''),'SIN CAJA')
+                   END AS caja,
+                   CASE
+                       WHEN v.sucursal_id=1 THEN 'GENERAL'
+                       WHEN UPPER(COALESCE(NULLIF(d.sector,''),NULLIF(cm.sector,''),NULLIF(u.sector,''),NULLIF(v.caja_nombre,''),'')) IN ('ABAJO','CAJA 2','CAJA ABAJO') THEN 'ABAJO'
+                       ELSE 'ARRIBA'
+                   END AS sector,
+                   v.tipo,
+                   CASE
+                       WHEN COALESCE(cm.mesa,'')<>'' THEN cm.mesa
+                       WHEN UPPER(COALESCE(v.tipo,''))='DIRECTA' THEN 'BAR / VENTA DIRECTA'
+                       WHEN COALESCE(v.session_id,0)>0 THEN CONCAT('SESIÓN ',v.session_id)
+                       ELSE ''
+                   END AS mesa,
+                   COALESCE(cm.mesera,'') AS mesera,
+                   COALESCE(cm.tiempo,'') AS tiempo_mesa,
+                   COALESCE(d.producto,'') AS producto,
+                   COALESCE(d.presentacion,'') AS presentacion,
+                   COALESCE(d.cantidad,0) AS cantidad,
+                   COALESCE(d.precio_unitario,0) AS precio_unitario,
+                   COALESCE(d.subtotal,0) AS subtotal_producto,
+                   CASE WHEN UPPER(COALESCE(v.tipo,''))='MESA'
+                        THEN GREATEST(COALESCE(cm.total_mesa, v.total - SUM(COALESCE(d.subtotal,0)) OVER (PARTITION BY v.id)),0)
+                        ELSE 0 END AS costo_tiempo_base,
+                   v.total
+                     - SUM(COALESCE(d.subtotal,0)) OVER (PARTITION BY v.id)
+                     - CASE WHEN UPPER(COALESCE(v.tipo,''))='MESA'
+                            THEN GREATEST(COALESCE(cm.total_mesa, v.total - SUM(COALESCE(d.subtotal,0)) OVER (PARTITION BY v.id)),0)
+                            ELSE 0 END AS ajuste_redondeo_base,
+                   v.metodo_pago,
+                   COALESCE(v.efectivo,0) AS efectivo,
+                   COALESCE(v.qr,0) AS qr,
+                   CASE WHEN UPPER(COALESCE(v.metodo_pago,''))='TRANSFERENCIA' THEN v.total ELSE 0 END AS transferencia,
+                   v.total,
+                   COALESCE(v.sync_key,'') AS sync_key,
+                   d.id AS detalle_id,
+                   ROW_NUMBER() OVER (PARTITION BY v.id ORDER BY COALESCE(d.id,0)) AS linea_venta
+            FROM ventas_canonicas v
+            LEFT JOIN detalle_ventas_canonico d ON d.venta_id=v.id
+            LEFT JOIN usuarios u ON u.usuario=v.cajero AND u.sucursal_id=v.sucursal_id
+            LEFT JOIN cobros_mesa cm ON cm.sucursal_id=v.sucursal_id
+                AND cm.session_id=v.session_id
+                AND UPPER(TRIM(COALESCE(cm.caja_nombre,'')))=UPPER(TRIM(COALESCE(v.caja_nombre,'')))
+            WHERE v.sucursal_id=@sucursal_id
+        ) z
+        WHERE z.fecha_turno BETWEEN @desde AND @hasta
+          AND (@turno='' OR UPPER(z.turno)=@turno)
+          AND (@sector='' OR UPPER(z.sector)=@sector)
+        ORDER BY z.fecha DESC, z.hora DESC, z.id_venta DESC, COALESCE(z.detalle_id,0);
+    """;
+
+    var ventas = await db.QueryAsync(con, ventasSql, pars);
+
+    string arqueosSql = """
+        SELECT c.id, c.sync_key, c.sucursal_id, c.sucursal, c.cajero_usuario, c.cajero_nombre,
+               c.caja,
+               CASE WHEN c.sucursal_id=1 THEN 'GENERAL'
+                    WHEN UPPER(COALESCE(c.caja,'')) LIKE '%ABAJO%' THEN 'ABAJO'
+                    ELSE 'ARRIBA' END AS sector,
+               c.turno, c.inicio, c.fin, c.hora_entrada, c.fecha_cierre,
+               c.transacciones_total, c.transacciones_efectivo, c.transacciones_qr,
+               c.transacciones_tarjeta, c.transacciones_transferencia,
+               c.efectivo, c.qr, c.tarjeta, c.transferencia, c.sin_metodo,
+               c.productos_total, c.mesas_total, c.minutos_jugados, c.propinas_total,
+               c.cortesias_valor, c.comisiones_total, c.gastos_total, c.perdidas_total,
+               c.total_generado, c.neto_turno, c.observaciones
+        FROM cierres_turno c
+        WHERE c.sucursal_id=@sucursal_id
+          AND DATE(COALESCE(c.inicio,c.fecha_cierre)) BETWEEN @desde AND @hasta
+          AND (@turno='' OR UPPER(COALESCE(c.turno,''))=@turno)
+          AND (@sector='' OR UPPER(CASE WHEN c.sucursal_id=1 THEN 'GENERAL'
+                    WHEN UPPER(COALESCE(c.caja,'')) LIKE '%ABAJO%' THEN 'ABAJO'
+                    ELSE 'ARRIBA' END)=@sector)
+        ORDER BY c.fecha_cierre DESC, c.id DESC;
+    """;
+
+    var arqueos = await db.QueryAsync(con, arqueosSql, pars);
+
+    decimal totalVentas=0, efectivo=0, qr=0, transferencia=0, costoTiempo=0, productos=0;
+    int transacciones=0;
+    var ventasUnicas = new HashSet<long>();
+    foreach (var r in ventas)
+    {
+        long id = ToLong(r, "id_venta");
+        decimal total = ToDecimal(r, "total_venta");
+        if (total != 0 && ventasUnicas.Add(id))
+        {
+            transacciones++;
+            totalVentas += total;
+            efectivo += ToDecimal(r, "efectivo");
+            qr += ToDecimal(r, "qr");
+            transferencia += ToDecimal(r, "transferencia");
+            costoTiempo += ToDecimal(r, "costo_tiempo");
+        }
+        productos += ToDecimal(r, "subtotal_producto");
+    }
+
+    decimal gastos=0, netoArqueos=0, propinas=0, comisiones=0;
+    foreach (var r in arqueos)
+    {
+        gastos += ToDecimal(r, "gastos_total");
+        netoArqueos += ToDecimal(r, "neto_turno");
+        propinas += ToDecimal(r, "propinas_total");
+        comisiones += ToDecimal(r, "comisiones_total");
+    }
+
+    return Results.Ok(new
+    {
+        ok=true,
+        sucursalId,
+        sucursal = sucursalId==2 ? "EL BRUJO PREMIU" : "EL BRUJO",
+        desde,
+        hasta,
+        turno = string.IsNullOrEmpty(turno) ? "TODOS" : turno,
+        sector = string.IsNullOrEmpty(sector) ? "TODOS" : sector,
+        resumen = new
+        {
+            transacciones,
+            totalVentas = Math.Round(totalVentas,2),
+            efectivo = Math.Round(efectivo,2),
+            qr = Math.Round(qr,2),
+            transferencia = Math.Round(transferencia,2),
+            ventaProductos = Math.Round(productos,2),
+            cobroTiempo = Math.Round(costoTiempo,2),
+            arqueos = arqueos.Count,
+            gastos = Math.Round(gastos,2),
+            propinas = Math.Round(propinas,2),
+            comisionesMeseras = Math.Round(comisiones,2),
+            netoArqueos = Math.Round(netoArqueos,2)
+        },
+        ventas,
+        arqueos
+    });
+});
+
 app.MapGet("/api/reportes/resumen", async (Db db) =>
 {
     await using var con = await db.OpenAsync();
@@ -3395,6 +3594,53 @@ app.MapGet("/api/reportes/resumen", async (Db db) =>
 
     return Results.Ok(new { porSucursal, total });
 });
+
+static async Task<bool> ValidarAdministradorAsync(MySqlConnection con, string? usuario, string? clave)
+{
+    string u=(usuario ?? "").Trim();
+    string c=clave ?? "";
+    if (u.Length==0 || c.Length==0) return false;
+    await using var cmd=new MySqlCommand("SELECT clave, rol, estado FROM usuarios WHERE usuario=@u LIMIT 1;",con);
+    cmd.Parameters.AddWithValue("@u",u);
+    await using var rd=await cmd.ExecuteReaderAsync();
+    if (!await rd.ReadAsync()) return false;
+    string guardada=rd.IsDBNull(0)?"":rd.GetString(0);
+    string rol=rd.IsDBNull(1)?"":rd.GetString(1);
+    string estado=rd.IsDBNull(2)?"":rd.GetString(2);
+    return estado.Equals("ACTIVO",StringComparison.OrdinalIgnoreCase)
+        && rol.Equals("ADMINISTRADOR",StringComparison.OrdinalIgnoreCase)
+        && PasswordHasher.Verify(c,guardada);
+}
+
+static string NormalizarFiltroTurno(string? turno)
+{
+    string t=(turno ?? "").Trim().ToUpperInvariant();
+    if (t is "TODOS" or "TODO" or "TODAS") return "";
+    if (t is "DIA" or "DÍA" or "MAÑANA" or "MANANA") return "MAÑANA";
+    if (t is "NOCHE") return "NOCHE";
+    return "";
+}
+
+static string NormalizarFiltroSector(int sucursalId, string? sector)
+{
+    if (sucursalId!=2) return "";
+    string s=(sector ?? "").Trim().ToUpperInvariant();
+    if (s.Contains("ABAJO")) return "ABAJO";
+    if (s.Contains("ARRIBA")) return "ARRIBA";
+    return "";
+}
+
+static decimal ToDecimal(Dictionary<string,object?> r,string key)
+{
+    if (!r.TryGetValue(key,out var v) || v is null || v is DBNull) return 0m;
+    try { return Convert.ToDecimal(v); } catch { return 0m; }
+}
+
+static long ToLong(Dictionary<string,object?> r,string key)
+{
+    if (!r.TryGetValue(key,out var v) || v is null || v is DBNull) return 0L;
+    try { return Convert.ToInt64(v); } catch { return 0L; }
+}
 
 app.Run();
 
@@ -6606,6 +6852,16 @@ public sealed record ShiftCloseRequest(
     string? Observaciones,
     string? DetalleJson,
     string? SyncKey
+);
+
+public sealed record AdminReportQueryRequest(
+    string Usuario,
+    string Clave,
+    int SucursalId,
+    string? Sector,
+    string? Turno,
+    DateTime? Desde,
+    DateTime? Hasta
 );
 
 public record LoginRequest(string Usuario, string Clave);
