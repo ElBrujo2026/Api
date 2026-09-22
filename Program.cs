@@ -78,7 +78,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
         return Results.Ok(new
         {
             ok = true,
-            version = "V77_FIX_COMPILACION_STOCK_SECTOR",
+            version = "V78_ANTI_DUPLICADO_VASOS_REALES",
             database,
             mysql = "conectado",
             googleSheets = sheets.IsConfigured ? "configurado" : "faltan variables GOOGLE_SHEET_ID y GOOGLE_CREDENTIALS_JSON",
@@ -96,10 +96,10 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
 app.MapGet("/api/system/version", () => Results.Ok(new
 {
     ok = true,
-    apiVersion = "V77_FIX_COMPILACION_STOCK_SECTOR",
-    minimumClientVersion = 159,
+    apiVersion = "V78_ANTI_DUPLICADO_VASOS_REALES",
+    minimumClientVersion = 160,
     accountingMode = "LIBRO_INMUTABLE_TRANSACCIONAL",
-    message = "Caja/Admin V159 o superior. PREMIU usa un catálogo común con stock separado ARRIBA/ABAJO y mesas configurables por sector."
+    message = "Caja/Admin V160 o superior. Ventas/stock idempotentes y vasos servidos descuentan de la botella de origen."
 }));
 
 app.MapGet("/api/sheets/status", async (SheetsReporter sheets) =>
@@ -145,7 +145,7 @@ app.MapGet("/api/sheets/debug", async (Db db, SheetsReporter sheets) =>
         return Results.Ok(new
         {
             ok = true,
-            apiVersion = "V74_PREMIU_MESAS_SECTOR_CAJA",
+            apiVersion = "V78_ANTI_DUPLICADO_VASOS_REALES",
             googleSheetsConfigured = sheets.IsConfigured,
             googleSheetsConnected = sheetsConnection.Ok,
             googleSheetsMessage = sheetsConnection.Message,
@@ -537,6 +537,7 @@ app.MapPost("/api/admin/productos/guardar", async (Db db, SheetsReporter sheets,
     string estado = string.Equals(req.Estado, "INACTIVO", StringComparison.OrdinalIgnoreCase) ? "INACTIVO" : "ACTIVO";
     string tipoComision = req.GeneraComision ? (req.TipoComision ?? "PORCENTAJE").Trim().ToUpperInvariant() : "NINGUNA";
     decimal valorComision = req.GeneraComision ? Math.Max(0, req.ValorComision) : 0;
+    int rendimientoVaso = req.RendimientoVaso <= 0 ? 10 : Math.Min(req.RendimientoVaso, 100);
 
     await using var con = await db.OpenAsync();
     await EnsureAppMeseraTables(con);
@@ -581,11 +582,11 @@ app.MapPost("/api/admin/productos/guardar", async (Db db, SheetsReporter sheets,
             await using var cmd = new MySqlCommand("""
                 INSERT INTO productos
                     (sucursal_id, sector, nombre, categoria, unidad_base, stock_actual, stock_minimo, estado,
-                     genera_comision, tipo_comision, valor_comision, sin_limite_stock,
+                     genera_comision, tipo_comision, valor_comision, sin_limite_stock, rendimiento_vaso,
                      tipo_entrada, unidades_por_entrada, precio_compra)
                 VALUES
                     (@sucursal_id, @sector, @nombre, @categoria, @unidad_base, @stock_actual, @stock_minimo, @estado,
-                     @genera_comision, @tipo_comision, @valor_comision, @sin_limite_stock,
+                     @genera_comision, @tipo_comision, @valor_comision, @sin_limite_stock, @rendimiento_vaso,
                      @tipo_entrada, @unidades_por_entrada, @precio_compra);
                 SELECT LAST_INSERT_ID();
             """, con, tx);
@@ -601,6 +602,7 @@ app.MapPost("/api/admin/productos/guardar", async (Db db, SheetsReporter sheets,
             cmd.Parameters.AddWithValue("@tipo_comision", tipoComision);
             cmd.Parameters.AddWithValue("@valor_comision", valorComision);
             cmd.Parameters.AddWithValue("@sin_limite_stock", req.SinLimiteStock ? 1 : 0);
+            cmd.Parameters.AddWithValue("@rendimiento_vaso", rendimientoVaso);
             cmd.Parameters.AddWithValue("@tipo_entrada", tipoEntrada);
             cmd.Parameters.AddWithValue("@unidades_por_entrada", unidadesPorEntrada);
             cmd.Parameters.AddWithValue("@precio_compra", precioCompra);
@@ -622,6 +624,7 @@ app.MapPost("/api/admin/productos/guardar", async (Db db, SheetsReporter sheets,
                     tipo_comision = @tipo_comision,
                     valor_comision = @valor_comision,
                     sin_limite_stock = @sin_limite_stock,
+                    rendimiento_vaso = @rendimiento_vaso,
                     tipo_entrada = @tipo_entrada,
                     unidades_por_entrada = @unidades_por_entrada,
                     precio_compra = @precio_compra
@@ -638,6 +641,7 @@ app.MapPost("/api/admin/productos/guardar", async (Db db, SheetsReporter sheets,
             cmd.Parameters.AddWithValue("@tipo_comision", tipoComision);
             cmd.Parameters.AddWithValue("@valor_comision", valorComision);
             cmd.Parameters.AddWithValue("@sin_limite_stock", req.SinLimiteStock ? 1 : 0);
+            cmd.Parameters.AddWithValue("@rendimiento_vaso", rendimientoVaso);
             cmd.Parameters.AddWithValue("@tipo_entrada", tipoEntrada);
             cmd.Parameters.AddWithValue("@unidades_por_entrada", unidadesPorEntrada);
             cmd.Parameters.AddWithValue("@precio_compra", precioCompra);
@@ -714,6 +718,71 @@ app.MapPost("/api/admin/productos/guardar", async (Db db, SheetsReporter sheets,
     {
         await tx.RollbackAsync();
         return Results.Problem("No se pudo guardar el producto: " + ex.Message);
+    }
+});
+
+// V78: ajuste manual del estado de una botella abierta. Sirve cuando el rendimiento real
+// difiere del estimado (derrame, vaso más cargado, etc.) sin tocar el stock de botellas cerradas.
+app.MapPost("/api/admin/vasos/estado", async (Db db, string clave, AdminGlassStateRequest req) =>
+{
+    const string cleanKey = "ENTREGAR_LIMPIO_2026";
+    if (clave != cleanKey) return Results.Unauthorized();
+    if (req.ProductoId <= 0) return Results.BadRequest(new { ok = false, message = "Producto/botella requerido." });
+
+    int sucursalId = req.SucursalId == 2 ? 2 : 1;
+    string sector = NormalizarSectorProducto(sucursalId, req.Sector);
+    int rendimiento = Math.Clamp(req.Rendimiento <= 0 ? 10 : req.Rendimiento, 1, 100);
+    int restantes = Math.Clamp(req.ServiciosRestantes, 0, Math.Max(0, rendimiento - 1));
+
+    await using var con = await db.OpenAsync();
+    await EnsureCoreSchemaAsync(con);
+    await using var tx = await con.BeginTransactionAsync();
+    try
+    {
+        int exists;
+        await using (var check = new MySqlCommand("SELECT COUNT(*) FROM productos WHERE id=@id AND sucursal_id=@s AND sector=@sector AND estado='ACTIVO';", con, tx))
+        {
+            check.Parameters.AddWithValue("@id", req.ProductoId);
+            check.Parameters.AddWithValue("@s", sucursalId);
+            check.Parameters.AddWithValue("@sector", sector);
+            exists = Convert.ToInt32(await check.ExecuteScalarAsync() ?? 0);
+        }
+        if (exists <= 0)
+        {
+            await tx.RollbackAsync();
+            return Results.NotFound(new { ok = false, message = "La botella no existe en esa sucursal/sector." });
+        }
+
+        await using (var updProduct = new MySqlCommand("UPDATE productos SET rendimiento_vaso=@r WHERE id=@id AND sucursal_id=@s AND sector=@sector;", con, tx))
+        {
+            updProduct.Parameters.AddWithValue("@r", rendimiento);
+            updProduct.Parameters.AddWithValue("@id", req.ProductoId);
+            updProduct.Parameters.AddWithValue("@s", sucursalId);
+            updProduct.Parameters.AddWithValue("@sector", sector);
+            await updProduct.ExecuteNonQueryAsync();
+        }
+
+        await using (var state = new MySqlCommand("""
+            INSERT INTO vaso_control (sucursal_id, sector, producto_id, rendimiento, servicios_restantes)
+            VALUES (@s,@sector,@p,@r,@rest)
+            ON DUPLICATE KEY UPDATE rendimiento=VALUES(rendimiento), servicios_restantes=VALUES(servicios_restantes);
+        """, con, tx))
+        {
+            state.Parameters.AddWithValue("@s", sucursalId);
+            state.Parameters.AddWithValue("@sector", sector);
+            state.Parameters.AddWithValue("@p", req.ProductoId);
+            state.Parameters.AddWithValue("@r", rendimiento);
+            state.Parameters.AddWithValue("@rest", restantes);
+            await state.ExecuteNonQueryAsync();
+        }
+
+        await tx.CommitAsync();
+        return Results.Ok(new { ok = true, sucursalId, sector, productoId = req.ProductoId, rendimiento, serviciosRestantes = restantes });
+    }
+    catch (Exception ex)
+    {
+        await tx.RollbackAsync();
+        return Results.Problem("No se pudo ajustar la botella abierta: " + ex.Message);
     }
 });
 
@@ -837,11 +906,14 @@ app.MapGet("/api/admin/productos/detalle", async (Db db, string clave, int sucur
                COALESCE(p.genera_comision,0) AS genera_comision,
                COALESCE(p.tipo_comision,'NINGUNA') AS tipo_comision,
                COALESCE(p.valor_comision,0) AS valor_comision,
+               COALESCE(p.rendimiento_vaso,10) AS rendimiento_vaso,
+               COALESCE(vc.servicios_restantes,0) AS vasos_restantes,
                p.estado,
                pr.id AS presentacion_id, pr.nombre AS presentacion,
                pr.cantidad_base, pr.precio_venta, pr.estado AS presentacion_estado
         FROM productos p
         LEFT JOIN presentaciones pr ON pr.producto_id = p.id
+        LEFT JOIN vaso_control vc ON vc.sucursal_id=p.sucursal_id AND vc.sector=p.sector AND vc.producto_id=p.id
         WHERE p.sucursal_id = @sucursal_id
           AND (@sector = '' OR p.sector = @sector)
           AND p.estado='ACTIVO'
@@ -1210,14 +1282,14 @@ app.MapPost("/api/app-mesera/pedidos", async (Db db, AppPedidoMovilRequest req) 
     if (esCompuesto)
     {
         List<CompositeInventoryDb.StockProduct> snapshot = await CompositeInventoryDb.LoadSnapshotAsync(con, req.SucursalId, sectorPedido);
-        decimal disponibles = CompositeInventoryDb.AvailableSales(snapshot, nombreCatalogo);
+        decimal disponibles = await CompositeInventoryDb.AvailableSalesAsync(con, req.SucursalId, sectorPedido, nombreCatalogo);
         if (disponibles < req.Cantidad)
         {
             return Results.Conflict(new
             {
                 ok = false,
                 code = "STOCK_COMPONENTES_INSUFICIENTE",
-                message = "No hay inventario físico suficiente para armar " + nombreCatalogo + ".",
+                message = "No hay inventario físico suficiente para armar/servir " + nombreCatalogo + ".",
                 disponible = disponibles,
                 solicitado = req.Cantidad,
                 detalle = CompositeInventoryDb.DescribeAvailable(snapshot, nombreCatalogo)
@@ -2170,8 +2242,8 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
     {
         // V45: bloqueo de cajas antiguas. Evita que una versión sin OperationKey/cola offline
         // vuelva a inflar ventas o stock.
-        if (!venta.ClientVersion.HasValue || venta.ClientVersion.Value < 159)
-            return Results.Json(new { ok = false, message = "Caja desactualizada. Se requiere Caja V159 o superior para registrar cobros en Railway.", minimumClientVersion = 159 }, statusCode: StatusCodes.Status426UpgradeRequired);
+        if (!venta.ClientVersion.HasValue || venta.ClientVersion.Value < 160)
+            return Results.Json(new { ok = false, message = "Caja desactualizada. Se requiere Caja V160 o superior para registrar cobros en Railway.", minimumClientVersion = 160 }, statusCode: StatusCodes.Status426UpgradeRequired);
 
         string syncKey = string.IsNullOrWhiteSpace(venta.SyncKey)
             ? Guid.NewGuid().ToString("N")
@@ -2183,7 +2255,7 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
         // V47: toda Caja V128+ debe traer las dos identidades. Si falta una, NO se inventa
         // una nueva en el servidor, porque eso podría transformar un reintento en otra venta.
         if (string.IsNullOrWhiteSpace(venta.SyncKey) || string.IsNullOrWhiteSpace(operationKey))
-            return Results.BadRequest(new { ok = false, message = "El cobro llegó sin SyncKey u OperationKey. Se bloqueó para evitar duplicación.", minimumClientVersion = 159 });
+            return Results.BadRequest(new { ok = false, message = "El cobro llegó sin SyncKey u OperationKey. Se bloqueó para evitar duplicación.", minimumClientVersion = 160 });
 
         // V54: candados de servidor. Serializan reintentos simultáneos aunque una base histórica
         // todavía no haya podido crear todos los índices UNIQUE por duplicados antiguos.
@@ -2341,9 +2413,9 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
                 .Select(d => (d.ConsumptionKey ?? "").Trim())
                 .ToList();
             if (partialKeys.Any(string.IsNullOrWhiteSpace))
-                return Results.BadRequest(new { ok = false, message = "Un pago parcial llegó con productos sin ConsumptionKey. Se bloqueó para evitar doble cobro.", minimumClientVersion = 159 });
+                return Results.BadRequest(new { ok = false, message = "Un pago parcial llegó con productos sin ConsumptionKey. Se bloqueó para evitar doble cobro.", minimumClientVersion = 160 });
             if (partialKeys.Distinct(StringComparer.OrdinalIgnoreCase).Count() != partialKeys.Count)
-                return Results.BadRequest(new { ok = false, message = "El mismo producto aparece repetido dentro del pago parcial. Se bloqueó para evitar inflación.", minimumClientVersion = 159 });
+                return Results.BadRequest(new { ok = false, message = "El mismo producto aparece repetido dentro del pago parcial. Se bloqueó para evitar inflación.", minimumClientVersion = 160 });
         }
 
         // V48: un cierre final de sesión se contabiliza una sola vez, aunque llegue con otra OperationKey.
@@ -5058,8 +5130,20 @@ static async Task EnsureCoreSchemaAsync(MySqlConnection con)
             tipo_comision VARCHAR(30) NOT NULL DEFAULT 'NINGUNA',
             valor_comision DECIMAL(12,2) NOT NULL DEFAULT 0,
             sin_limite_stock TINYINT(1) NOT NULL DEFAULT 0,
+            rendimiento_vaso INT NOT NULL DEFAULT 10,
             KEY ix_productos_sucursal_sector_nombre (sucursal_id, sector, nombre),
             KEY ix_productos_sucursal_estado (sucursal_id, estado)
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS vaso_control (
+            sucursal_id INT NOT NULL,
+            sector VARCHAR(20) NOT NULL DEFAULT 'GENERAL',
+            producto_id BIGINT NOT NULL,
+            rendimiento INT NOT NULL DEFAULT 10,
+            servicios_restantes INT NOT NULL DEFAULT 0,
+            actualizado TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (sucursal_id, sector, producto_id)
         );
         """,
         """
@@ -5469,9 +5553,9 @@ static async Task MirrorPremiumCatalogAsync(MySqlConnection con, MySqlTransactio
         await using var clone = new MySqlCommand("""
             INSERT INTO productos
             (sucursal_id,sector,nombre,categoria,tipo_entrada,unidad_base,unidades_por_entrada,precio_compra,
-             stock_actual,stock_minimo,estado,genera_comision,tipo_comision,valor_comision,sin_limite_stock)
+             stock_actual,stock_minimo,estado,genera_comision,tipo_comision,valor_comision,sin_limite_stock,rendimiento_vaso)
             SELECT 2,@other,nombre,categoria,tipo_entrada,unidad_base,unidades_por_entrada,precio_compra,
-                   0,stock_minimo,estado,genera_comision,tipo_comision,valor_comision,sin_limite_stock
+                   0,stock_minimo,estado,genera_comision,tipo_comision,valor_comision,sin_limite_stock,rendimiento_vaso
             FROM productos WHERE id=@src;
             SELECT LAST_INSERT_ID();
         """, con, tx);
@@ -5488,7 +5572,8 @@ static async Task MirrorPremiumCatalogAsync(MySqlConnection con, MySqlTransactio
                 dst.unidad_base=src.unidad_base,dst.unidades_por_entrada=src.unidades_por_entrada,
                 dst.precio_compra=src.precio_compra,dst.stock_minimo=src.stock_minimo,dst.estado=src.estado,
                 dst.genera_comision=src.genera_comision,dst.tipo_comision=src.tipo_comision,
-                dst.valor_comision=src.valor_comision,dst.sin_limite_stock=src.sin_limite_stock
+                dst.valor_comision=src.valor_comision,dst.sin_limite_stock=src.sin_limite_stock,
+                dst.rendimiento_vaso=src.rendimiento_vaso
             WHERE dst.id=@dst;
         """, con, tx);
         upd.Parameters.AddWithValue("@src", sourceId);
@@ -5554,9 +5639,9 @@ static async Task EnsurePremiumSectorStockAsync(MySqlConnection con)
                 await using var clone = new MySqlCommand("""
                     INSERT INTO productos
                     (sucursal_id,sector,nombre,categoria,tipo_entrada,unidad_base,unidades_por_entrada,precio_compra,
-                     stock_actual,stock_minimo,estado,genera_comision,tipo_comision,valor_comision,sin_limite_stock)
+                     stock_actual,stock_minimo,estado,genera_comision,tipo_comision,valor_comision,sin_limite_stock,rendimiento_vaso)
                     SELECT sucursal_id,'ARRIBA',nombre,categoria,tipo_entrada,unidad_base,unidades_por_entrada,precio_compra,
-                           0,stock_minimo,estado,genera_comision,tipo_comision,valor_comision,sin_limite_stock
+                           0,stock_minimo,estado,genera_comision,tipo_comision,valor_comision,sin_limite_stock,rendimiento_vaso
                     FROM productos WHERE id=@src;
                     SELECT LAST_INSERT_ID();
                 """, con, tx);
@@ -5588,9 +5673,9 @@ static async Task EnsurePremiumSectorStockAsync(MySqlConnection con)
                 await using var clone = new MySqlCommand("""
                     INSERT INTO productos
                     (sucursal_id,sector,nombre,categoria,tipo_entrada,unidad_base,unidades_por_entrada,precio_compra,
-                     stock_actual,stock_minimo,estado,genera_comision,tipo_comision,valor_comision,sin_limite_stock)
+                     stock_actual,stock_minimo,estado,genera_comision,tipo_comision,valor_comision,sin_limite_stock,rendimiento_vaso)
                     SELECT sucursal_id,@sector,nombre,categoria,tipo_entrada,unidad_base,unidades_por_entrada,precio_compra,
-                           0,stock_minimo,estado,genera_comision,tipo_comision,valor_comision,sin_limite_stock
+                           0,stock_minimo,estado,genera_comision,tipo_comision,valor_comision,sin_limite_stock,rendimiento_vaso
                     FROM productos WHERE id=@src;
                     SELECT LAST_INSERT_ID();
                 """, con, tx);
@@ -5944,6 +6029,10 @@ static async Task EnsureAppMeseraTables(MySqlConnection con)
     await using (var alter7 = new MySqlCommand("ALTER TABLE productos ADD COLUMN precio_compra DECIMAL(10,2) NOT NULL DEFAULT 0;", con))
     {
         try { await alter7.ExecuteNonQueryAsync(); } catch { }
+    }
+    await using (var alter8 = new MySqlCommand("ALTER TABLE productos ADD COLUMN rendimiento_vaso INT NOT NULL DEFAULT 10;", con))
+    {
+        try { await alter8.ExecuteNonQueryAsync(); } catch { }
     }
 
     // Migración de nombres de categoría solicitados para el módulo Productos / Stock.
@@ -7247,6 +7336,14 @@ public sealed record AdminProductPresentationRequest(
 );
 
 
+public sealed record AdminGlassStateRequest(
+    int SucursalId,
+    string? Sector,
+    long ProductoId,
+    int Rendimiento,
+    int ServiciosRestantes
+);
+
 public sealed record AdminStockAdjustmentRequest(
     string OperationKey,
     long? ProductoId,
@@ -7272,6 +7369,7 @@ public sealed record AdminProductRequest(
     bool GeneraComision,
     string TipoComision,
     decimal ValorComision,
+    int RendimientoVaso,
     string Estado,
     List<AdminProductPresentationRequest>? Presentaciones,
     string? Sector = null
@@ -7459,6 +7557,7 @@ public static class CompositeInventoryDb
         public string Category { get; set; } = "";
         public decimal Stock { get; set; }
         public bool Unlimited { get; set; }
+        public int GlassYield { get; set; } = 10;
     }
 
     public sealed class StockPart
@@ -7472,9 +7571,23 @@ public static class CompositeInventoryDb
         => (value ?? "").Trim().ToUpperInvariant()
             .Replace("Á", "A").Replace("É", "E").Replace("Í", "I").Replace("Ó", "O").Replace("Ú", "U").Replace("Ñ", "N");
 
+    public static bool IsServedGlassName(string? productName, string? category = null)
+    {
+        string n = N(productName);
+        string c = N(category);
+        if (c.Contains("SERVIDOS EN VASO") || c.Contains("SERVIDO EN VASO")) return true;
+        if (n.StartsWith("PROMO VASO") && n.Contains("FERNET")) return true;
+        return n == "VASO FERNET" || n.StartsWith("VASO DE FERNET") ||
+               n == "VASO FLOR DE CANA" || n == "VASO RUM/RON ABUELO" || n == "VASO RON ABUELO" || n == "VASO DE RON" ||
+               n == "VASO TEQUILA" || n == "VASO VINO" || n == "VASO VINO TINTO" ||
+               n == "VASO WHISKY" || n == "VASO WISKIE" || n == "VASO DE WISKIE" || n == "VASO DE WHISKY" ||
+               n == "VASO CHUFLAY";
+    }
+
     public static bool IsComposite(string? productName)
     {
         string n = N(productName);
+        if (IsServedGlassName(productName)) return true;
         if (!(n.StartsWith("COMBO ") || n.StartsWith("PROMO "))) return false;
         return n.Contains("FERNET") || n.Contains("FLOR DE CANA") || n.Contains("HABANA") || n.Contains("HAVANA") || n.Contains("GIN") ||
                n.Contains("AMSTEL") || n.Contains("CONTI") || n.Contains("CORONA") || n.Contains("PACENA") || n.Contains("RON ABUELO");
@@ -7524,7 +7637,8 @@ public static class CompositeInventoryDb
     public static async Task<List<StockProduct>> LoadSnapshotAsync(MySqlConnection con, int sucursalId, string sector, MySqlTransaction? tx = null, bool forUpdate = false)
     {
         string sql = """
-            SELECT id, nombre, categoria, stock_actual, COALESCE(sin_limite_stock,0) AS sin_limite_stock
+            SELECT id, nombre, categoria, stock_actual, COALESCE(sin_limite_stock,0) AS sin_limite_stock,
+                   COALESCE(rendimiento_vaso,10) AS rendimiento_vaso
             FROM productos
             WHERE sucursal_id=@sucursal_id AND sector=@sector AND estado='ACTIVO'
             ORDER BY id
@@ -7542,14 +7656,38 @@ public static class CompositeInventoryDb
                 Name = rd.IsDBNull(1) ? "" : rd.GetString(1),
                 Category = rd.IsDBNull(2) ? "" : rd.GetString(2),
                 Stock = rd.IsDBNull(3) ? 0M : rd.GetDecimal(3),
-                Unlimited = !rd.IsDBNull(4) && rd.GetInt32(4) == 1
+                Unlimited = !rd.IsDBNull(4) && rd.GetInt32(4) == 1,
+                GlassYield = rd.IsDBNull(5) ? 10 : Math.Max(1, rd.GetInt32(5))
             });
         }
         return result;
     }
 
+    static bool TryGlassBase(List<StockProduct> all, string servedName, out StockProduct? baseProduct)
+    {
+        // Solo una botella física puede ser origen de un vaso servido.
+        // Evita que "VASO FERNET" termine encontrándose a sí mismo si falta FERNET.
+        List<StockProduct> physical = all.Where(x => !IsComposite(x.Name)).ToList();
+        string n = N(servedName);
+        baseProduct = null;
+        if (n.Contains("FERNET")) baseProduct = FindOne(physical, "FERNET");
+        else if (n.Contains("FLOR DE CANA")) baseProduct = FindOne(physical, "RON FLOR DE CAÑA", "FLOR DE CAÑA");
+        else if (n.Contains("RON ABUELO") || n.Contains("RUM/RON ABUELO") || n == "VASO DE RON") baseProduct = FindOne(physical, "RON ABUELO");
+        else if (n.Contains("TEQUILA")) baseProduct = FindOne(physical, "TEQUILA JOSE CUERVO", "TEQUILA");
+        else if (n.Contains("WHISKY") || n.Contains("WISKIE")) baseProduct = FindOne(physical, "QUISQUE BLACK LABEL", "WHIKY BLACK LABEL", "BLACK LABEL");
+        else if (n.Contains("VINO TINTO")) baseProduct = FindOne(physical, "VINO TINTO");
+        else if (n.Contains("VINO")) baseProduct = FindOne(physical, "VINO BLANCO");
+        else if (n.Contains("CHUFLAY")) baseProduct = FindOne(physical, "FLOW CHUFLAY", "CHUFLAY");
+        return baseProduct != null;
+    }
+
     public static decimal AvailableSales(List<StockProduct> all, string productName)
     {
+        if (IsServedGlassName(productName))
+        {
+            if (!TryGlassBase(all, productName, out StockProduct? b) || b == null) return 0M;
+            return b.Unlimited ? 1000000000M : Math.Floor(Qty(b) * Math.Max(1, b.GlassYield));
+        }
         if (!IsComposite(productName))
         {
             StockProduct? own = FindOne(all, productName);
@@ -7570,12 +7708,6 @@ public static class CompositeInventoryDb
             return Math.Floor(Math.Min(Qty(baseProduct), sodaTotal));
         }
 
-        if (n.Contains("VASO") && n.Contains("FERNET"))
-        {
-            StockProduct? vaso = FindOne(all, "VASO DE FERNET + COCA COLA 2L E 3L", "VASO FERNET", "VASO DE FERNET");
-            return Math.Floor(Qty(vaso));
-        }
-
         StockProduct? beer = n.Contains("AMSTEL") ? FindOne(all, "CERVEZA AMSTEL", "AMSTEL") :
             n.Contains("CONTI") ? FindOne(all, "CERVEZA CONTI", "CONTI") :
             n.Contains("CORONA") ? FindOne(all, "CERVEZA CORONA", "CORONA") :
@@ -7583,9 +7715,34 @@ public static class CompositeInventoryDb
         return beer == null ? 0M : Math.Floor(Qty(beer) / BeerUnits(productName));
     }
 
+    public static async Task<decimal> AvailableSalesAsync(MySqlConnection con, int sucursalId, string sector, string productName)
+    {
+        List<StockProduct> all = await LoadSnapshotAsync(con, sucursalId, sector);
+        if (!IsServedGlassName(productName)) return AvailableSales(all, productName);
+        if (!TryGlassBase(all, productName, out StockProduct? b) || b == null) return 0M;
+        if (b.Unlimited) return 1000000000M;
+        int remaining = 0;
+        await using (var q = new MySqlCommand("SELECT servicios_restantes FROM vaso_control WHERE sucursal_id=@s AND sector=@sector AND producto_id=@p LIMIT 1;", con))
+        {
+            q.Parameters.AddWithValue("@s", sucursalId);
+            q.Parameters.AddWithValue("@sector", NormalizarSectorProductoInterno(sucursalId, sector));
+            q.Parameters.AddWithValue("@p", b.Id);
+            object? v = await q.ExecuteScalarAsync();
+            if (v != null) remaining = Math.Max(0, Convert.ToInt32(v));
+        }
+        int yield = Math.Max(1, b.GlassYield);
+        remaining = Math.Clamp(remaining, 0, Math.Max(0, yield - 1));
+        return remaining + Math.Floor(Qty(b) * yield);
+    }
+
     public static string DescribeAvailable(List<StockProduct> all, string productName)
     {
         string n = N(productName);
+        if (IsServedGlassName(productName))
+        {
+            if (!TryGlassBase(all, productName, out StockProduct? b) || b == null) return "Falta configurar la botella de origen";
+            return b.Name + " · " + Math.Max(1, b.GlassYield) + " vasos por botella";
+        }
         if (!IsComposite(productName)) return productName;
         if (n.StartsWith("COMBO "))
         {
@@ -7597,11 +7754,6 @@ public static class CompositeInventoryDb
             string soda = string.Join(", ", Sodas(all).Where(x => Qty(x) > 0).Select(x => x.Name));
             return (baseProduct?.Name ?? "Producto base") + " + soda disponible: " + (string.IsNullOrWhiteSpace(soda) ? "AGOTADA" : soda);
         }
-        if (n.Contains("VASO") && n.Contains("FERNET"))
-        {
-            StockProduct? vaso = FindOne(all, "VASO DE FERNET + COCA COLA 2L E 3L", "VASO FERNET", "VASO DE FERNET");
-            return vaso == null ? productName : "1 x " + vaso.Name;
-        }
         StockProduct? beer = n.Contains("AMSTEL") ? FindOne(all, "CERVEZA AMSTEL", "AMSTEL") :
             n.Contains("CONTI") ? FindOne(all, "CERVEZA CONTI", "CONTI") :
             n.Contains("CORONA") ? FindOne(all, "CERVEZA CORONA", "CORONA") :
@@ -7611,8 +7763,6 @@ public static class CompositeInventoryDb
 
     static bool TryAllocate(List<StockProduct> all, string productName, decimal saleQty, out List<StockPart> parts, out string error)
     {
-        // CS1628 fix: an out/ref/in parameter cannot be captured by a local function.
-        // Build the allocation in a normal local list and expose that same list through `parts`.
         var allocatedParts = new List<StockPart>();
         parts = allocatedParts;
         error = "";
@@ -7639,9 +7789,8 @@ public static class CompositeInventoryDb
                     StockProduct? baseProduct = n.Contains("FERNET") ? FindOne(all, "FERNET") :
                         n.Contains("FLOR DE CANA") ? FindOne(all, "RON FLOR DE CAÑA", "FLOR DE CAÑA") :
                         n.Contains("HABANA") || n.Contains("HAVANA") ? FindOne(all, "RON HABANA 7 AÑOS", "HABANA 7", "HAVANA") :
-                n.Contains("RON ABUELO") ? FindOne(all, "RON ABUELO") : null;
+                        n.Contains("RON ABUELO") ? FindOne(all, "RON ABUELO") : null;
                     Need(baseProduct, saleQty, "producto base del combo");
-
                     decimal remain = saleQty;
                     foreach (StockProduct soda in Sodas(all))
                     {
@@ -7659,18 +7808,11 @@ public static class CompositeInventoryDb
             }
             else
             {
-                if (n.Contains("VASO") && n.Contains("FERNET"))
-                {
-                    Need(FindOne(all, "VASO DE FERNET + COCA COLA 2L E 3L", "VASO FERNET", "VASO DE FERNET"), saleQty, "VASO FERNET");
-                }
-                else
-                {
-                    StockProduct? beer = n.Contains("AMSTEL") ? FindOne(all, "CERVEZA AMSTEL", "AMSTEL") :
-                        n.Contains("CONTI") ? FindOne(all, "CERVEZA CONTI", "CONTI") :
-                        n.Contains("CORONA") ? FindOne(all, "CERVEZA CORONA", "CORONA") :
-                        n.Contains("PACENA") ? FindOne(all, "CERVEZA PACEÑA", "PACEÑA", "PACENA") : null;
-                    Need(beer, BeerUnits(productName) * saleQty, "cerveza de la promoción");
-                }
+                StockProduct? beer = n.Contains("AMSTEL") ? FindOne(all, "CERVEZA AMSTEL", "AMSTEL") :
+                    n.Contains("CONTI") ? FindOne(all, "CERVEZA CONTI", "CONTI") :
+                    n.Contains("CORONA") ? FindOne(all, "CERVEZA CORONA", "CORONA") :
+                    n.Contains("PACENA") ? FindOne(all, "CERVEZA PACEÑA", "PACEÑA", "PACENA") : null;
+                Need(beer, BeerUnits(productName) * saleQty, "cerveza de la promoción");
             }
         }
         catch (Exception ex) { error = ex.Message; return false; }
@@ -7688,9 +7830,96 @@ public static class CompositeInventoryDb
         return true;
     }
 
+    static async Task<(bool Ok, string Error, string Description, List<StockPart> Parts)> ReserveServedGlassAsync(
+        MySqlConnection con, MySqlTransaction tx, int sucursalId, string sector, string productName, decimal saleQty)
+    {
+        List<StockProduct> all = await LoadSnapshotAsync(con, sucursalId, sector, tx, true);
+        if (!TryGlassBase(all, productName, out StockProduct? baseProduct) || baseProduct == null)
+            return (false, "No está configurada la botella de origen para " + productName + ".", "", new());
+        if (baseProduct.Unlimited)
+            return (true, "", saleQty + " vaso(s) de " + baseProduct.Name + " (sin límite)", new());
+
+        string sectorNorm = NormalizarSectorProductoInterno(sucursalId, sector);
+        int yield = Math.Max(1, baseProduct.GlassYield);
+        int requested = Math.Max(1, (int)Math.Ceiling(saleQty));
+
+        await using (var ensure = new MySqlCommand("""
+            INSERT IGNORE INTO vaso_control (sucursal_id, sector, producto_id, rendimiento, servicios_restantes)
+            VALUES (@s,@sector,@p,@r,0);
+        """, con, tx))
+        {
+            ensure.Parameters.AddWithValue("@s", sucursalId);
+            ensure.Parameters.AddWithValue("@sector", sectorNorm);
+            ensure.Parameters.AddWithValue("@p", baseProduct.Id);
+            ensure.Parameters.AddWithValue("@r", yield);
+            await ensure.ExecuteNonQueryAsync();
+        }
+
+        int remaining;
+        await using (var q = new MySqlCommand("SELECT servicios_restantes FROM vaso_control WHERE sucursal_id=@s AND sector=@sector AND producto_id=@p FOR UPDATE;", con, tx))
+        {
+            q.Parameters.AddWithValue("@s", sucursalId);
+            q.Parameters.AddWithValue("@sector", sectorNorm);
+            q.Parameters.AddWithValue("@p", baseProduct.Id);
+            remaining = Convert.ToInt32(await q.ExecuteScalarAsync() ?? 0);
+        }
+        remaining = Math.Clamp(remaining, 0, Math.Max(0, yield - 1));
+
+        int available = remaining + (int)Math.Floor(Math.Max(0M, baseProduct.Stock)) * yield;
+        if (available < requested)
+            return (false, "Inventario insuficiente: " + baseProduct.Name + ". Vasos disponibles: " + available + ".", "", new());
+
+        int need = requested;
+        int fromOpen = Math.Min(Math.Max(0, remaining), need);
+        remaining -= fromOpen;
+        need -= fromOpen;
+        int bottlesOpened = need <= 0 ? 0 : (int)Math.Ceiling(need / (double)yield);
+
+        if (bottlesOpened > 0)
+        {
+            await using var upd = new MySqlCommand("""
+                UPDATE productos
+                SET stock_actual = stock_actual - @bottles
+                WHERE id=@id AND sucursal_id=@sucursal_id AND sector=@sector
+                  AND estado='ACTIVO' AND COALESCE(sin_limite_stock,0)=0
+                  AND stock_actual >= @bottles;
+            """, con, tx);
+            upd.Parameters.AddWithValue("@bottles", bottlesOpened);
+            upd.Parameters.AddWithValue("@id", baseProduct.Id);
+            upd.Parameters.AddWithValue("@sucursal_id", sucursalId);
+            upd.Parameters.AddWithValue("@sector", sectorNorm);
+            if (await upd.ExecuteNonQueryAsync() != 1)
+                return (false, "El inventario cambió mientras se servía el vaso. Actualiza e inténtalo nuevamente.", "", new());
+            remaining = bottlesOpened * yield - need;
+        }
+
+        await using (var upState = new MySqlCommand("""
+            UPDATE vaso_control
+            SET rendimiento=@r, servicios_restantes=@rest
+            WHERE sucursal_id=@s AND sector=@sector AND producto_id=@p;
+        """, con, tx))
+        {
+            upState.Parameters.AddWithValue("@r", yield);
+            upState.Parameters.AddWithValue("@rest", Math.Max(0, remaining));
+            upState.Parameters.AddWithValue("@s", sucursalId);
+            upState.Parameters.AddWithValue("@sector", sectorNorm);
+            upState.Parameters.AddWithValue("@p", baseProduct.Id);
+            await upState.ExecuteNonQueryAsync();
+        }
+
+        List<StockPart> parts = bottlesOpened > 0
+            ? new List<StockPart> { new StockPart { ProductId = baseProduct.Id, ProductName = baseProduct.Name, Units = bottlesOpened } }
+            : new List<StockPart>();
+        string desc = requested + " vaso(s) de " + baseProduct.Name + " · " + yield + " vasos/botella · quedan " + Math.Max(0, remaining) + " en botella abierta";
+        return (true, "", desc, parts);
+    }
+
     public static async Task<(bool Ok, string Error, string Description, List<StockPart> Parts)> ReserveAsync(
         MySqlConnection con, MySqlTransaction tx, int sucursalId, string sector, string productName, decimal saleQty)
     {
+        if (IsServedGlassName(productName))
+            return await ReserveServedGlassAsync(con, tx, sucursalId, sector, productName, saleQty);
+
         List<StockProduct> all = await LoadSnapshotAsync(con, sucursalId, sector, tx, true);
         if (!TryAllocate(all, productName, saleQty, out List<StockPart> parts, out string error))
             return (false, error, "", parts);
@@ -7702,13 +7931,14 @@ public static class CompositeInventoryDb
             await using var upd = new MySqlCommand("""
                 UPDATE productos
                 SET stock_actual = stock_actual - @units
-                WHERE id=@id AND sucursal_id=@sucursal_id
+                WHERE id=@id AND sucursal_id=@sucursal_id AND sector=@sector
                   AND estado='ACTIVO' AND COALESCE(sin_limite_stock,0)=0
                   AND stock_actual >= @units;
             """, con, tx);
             upd.Parameters.AddWithValue("@units", part.Units);
             upd.Parameters.AddWithValue("@id", part.ProductId);
             upd.Parameters.AddWithValue("@sucursal_id", sucursalId);
+            upd.Parameters.AddWithValue("@sector", NormalizarSectorProductoInterno(sucursalId, sector));
             if (await upd.ExecuteNonQueryAsync() != 1)
                 return (false, "El inventario cambió mientras se registraba la venta. Actualiza el catálogo e inténtalo nuevamente.", "", parts);
         }
