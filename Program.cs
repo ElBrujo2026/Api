@@ -3589,7 +3589,8 @@ app.MapPost("/api/admin/reportes/consulta", async (Db db, AdminReportQueryReques
     // Una fila por producto. Totales y medios de pago aparecen solo en la primera
     // línea de cada venta para que Excel se pueda sumar sin inflar el dinero.
     string ventasSql = """
-        SELECT z.id_venta, z.fecha_turno, z.turno, z.fecha, z.hora, z.cajero, z.caja, z.sector,
+        SELECT z.id_venta, z.fecha_turno, z.turno, z.fecha, z.hora,
+               z.cajero_usuario, z.cajero_nombre, z.cajero_usuario AS cajero, z.caja, z.sector,
                z.tipo, z.mesa, z.mesera, z.tiempo_mesa,
                z.producto, z.presentacion, z.cantidad, z.precio_unitario, z.subtotal_producto,
                CASE WHEN z.linea_venta=1 THEN z.costo_tiempo_base ELSE 0 END AS costo_tiempo,
@@ -3614,7 +3615,8 @@ app.MapPost("/api/admin/reportes/consulta", async (Db db, AdminReportQueryReques
                    COALESCE(NULLIF(v.turno,''), CASE WHEN TIME(v.fecha) >= '08:00:00' AND TIME(v.fecha) < '20:00:00' THEN 'MAÑANA' ELSE 'NOCHE' END) AS turno,
                    DATE(v.fecha) AS fecha,
                    TIME(v.fecha) AS hora,
-                   v.cajero,
+                   v.cajero AS cajero_usuario,
+                   COALESCE(NULLIF(u.nombre_completo,''), v.cajero) AS cajero_nombre,
                    CASE
                        WHEN v.sucursal_id=1 THEN 'CAJA ÚNICA'
                        WHEN UPPER(COALESCE(NULLIF(v.caja_nombre,''),u.caja_nombre,'')) IN ('CAJA 2','CAJA ABAJO') THEN 'CAJA ABAJO'
