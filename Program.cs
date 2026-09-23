@@ -80,7 +80,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
         return Results.Ok(new
         {
             ok = true,
-            version = "V78_ANTI_DUPLICADO_VASOS_REALES",
+            version = "V84_STOCK_ANTIINFLACION_V167",
             database,
             mysql = "conectado",
             googleSheets = sheets.IsConfigured ? "configurado" : "faltan variables GOOGLE_SHEET_ID y GOOGLE_CREDENTIALS_JSON",
@@ -98,10 +98,10 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
 app.MapGet("/api/system/version", () => Results.Ok(new
 {
     ok = true,
-    apiVersion = "V81_PROMO_PRIVADA_EDITABLE",
-    minimumClientVersion = 164,
+    apiVersion = "V84_STOCK_ANTIINFLACION_V167",
+    minimumClientVersion = 167,
     accountingMode = "LIBRO_INMUTABLE_TRANSACCIONAL",
-    message = "API V81. Promoción 2x1 configurable con tarifa independiente NORMAL/PRIVADA; conserva stock por sector, combos, anti-duplicado y vasos."
+    message = "API V84. Sincronización anti-inflación de stock; requiere Caja V167 o superior. Conserva mesas dinámicas, catálogo Premium, promociones, combos y anti-duplicado."
 }));
 
 app.MapGet("/api/sheets/status", async (SheetsReporter sheets) =>
@@ -2301,8 +2301,8 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
     {
         // V45: bloqueo de cajas antiguas. Evita que una versión sin OperationKey/cola offline
         // vuelva a inflar ventas o stock.
-        if (!venta.ClientVersion.HasValue || venta.ClientVersion.Value < 164)
-            return Results.Json(new { ok = false, message = "Caja desactualizada. Se requiere Caja V164 o superior para aplicar correctamente promociones NORMAL/PRIVADA.", minimumClientVersion = 164 }, statusCode: StatusCodes.Status426UpgradeRequired);
+        if (!venta.ClientVersion.HasValue || venta.ClientVersion.Value < 167)
+            return Results.Json(new { ok = false, message = "Caja desactualizada. Se requiere Caja V167 o superior para garantizar sincronización anti-inflación de inventario.", minimumClientVersion = 167 }, statusCode: StatusCodes.Status426UpgradeRequired);
 
         string syncKey = string.IsNullOrWhiteSpace(venta.SyncKey)
             ? Guid.NewGuid().ToString("N")
@@ -2314,7 +2314,7 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
         // V47: toda Caja V128+ debe traer las dos identidades. Si falta una, NO se inventa
         // una nueva en el servidor, porque eso podría transformar un reintento en otra venta.
         if (string.IsNullOrWhiteSpace(venta.SyncKey) || string.IsNullOrWhiteSpace(operationKey))
-            return Results.BadRequest(new { ok = false, message = "El cobro llegó sin SyncKey u OperationKey. Se bloqueó para evitar duplicación.", minimumClientVersion = 164 });
+            return Results.BadRequest(new { ok = false, message = "El cobro llegó sin SyncKey u OperationKey. Se bloqueó para evitar duplicación.", minimumClientVersion = 167 });
 
         // V54: candados de servidor. Serializan reintentos simultáneos aunque una base histórica
         // todavía no haya podido crear todos los índices UNIQUE por duplicados antiguos.
@@ -2472,9 +2472,9 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
                 .Select(d => (d.ConsumptionKey ?? "").Trim())
                 .ToList();
             if (partialKeys.Any(string.IsNullOrWhiteSpace))
-                return Results.BadRequest(new { ok = false, message = "Un pago parcial llegó con productos sin ConsumptionKey. Se bloqueó para evitar doble cobro.", minimumClientVersion = 164 });
+                return Results.BadRequest(new { ok = false, message = "Un pago parcial llegó con productos sin ConsumptionKey. Se bloqueó para evitar doble cobro.", minimumClientVersion = 167 });
             if (partialKeys.Distinct(StringComparer.OrdinalIgnoreCase).Count() != partialKeys.Count)
-                return Results.BadRequest(new { ok = false, message = "El mismo producto aparece repetido dentro del pago parcial. Se bloqueó para evitar inflación.", minimumClientVersion = 164 });
+                return Results.BadRequest(new { ok = false, message = "El mismo producto aparece repetido dentro del pago parcial. Se bloqueó para evitar inflación.", minimumClientVersion = 167 });
         }
 
         // V48: un cierre final de sesión se contabiliza una sola vez, aunque llegue con otra OperationKey.
@@ -2749,7 +2749,7 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
                             SET stock_actual = CASE
                                 WHEN COALESCE(sin_limite_stock, 0) = 1
                                 THEN stock_actual
-                                ELSE GREATEST(stock_actual - @cantidad_base, 0)
+                                ELSE stock_actual - @cantidad_base
                             END
                             WHERE id = @producto_id AND sector=@sector;
                         """, con, tx);
@@ -3104,7 +3104,10 @@ app.MapPost("/api/mesas/estado", async (Db db, SheetsReporter sheets, MesaEstado
     await EnsureMesasEnVivoTables(con);
 
     string sector = NormalizarSector(m.SucursalId, m.Sector);
-    int maxMesa = m.SucursalId == 2 ? (sector == "ABAJO" ? 10 : 5) : 8;
+    var layoutActual = await EnsureTableLayoutSettingsAsync(con);
+    int maxMesa = m.SucursalId == 2
+        ? (sector == "ABAJO" ? layoutActual.premiumAbajo : layoutActual.premiumArriba)
+        : layoutActual.brujo;
     if (m.MesaId <= 0 || m.MesaId > maxMesa)
         return Results.BadRequest(new { ok=false, message="Mesa fuera del rango oficial para esta caja/sector.", sector, mesaId=m.MesaId, maxMesa });
 
@@ -5660,6 +5663,60 @@ static async Task MirrorPremiumCatalogAsync(MySqlConnection con, MySqlTransactio
     await pres.ExecuteNonQueryAsync();
 }
 
+static async Task EnsurePremiumSectorPairsAsync(MySqlConnection con)
+{
+    // V83: un catálogo lógico, dos existencias físicas. Si un producto activo existe
+    // solo en ARRIBA o solo en ABAJO, crea la ficha hermana con stock 0 y copia precios.
+    // Nunca suma ni copia el stock del otro sector.
+    await using var tx = await con.BeginTransactionAsync();
+    try
+    {
+        var activos = new List<(long id, string nombre, string sector)>();
+        await using (var q = new MySqlCommand("SELECT id,nombre,sector FROM productos WHERE sucursal_id=2 AND estado='ACTIVO' AND sector IN ('ARRIBA','ABAJO') ORDER BY id FOR UPDATE;", con, tx))
+        await using (var rd = await q.ExecuteReaderAsync())
+        {
+            while (await rd.ReadAsync())
+                activos.Add((rd.GetInt64(0), rd.IsDBNull(1) ? "" : rd.GetString(1), rd.IsDBNull(2) ? "ABAJO" : rd.GetString(2)));
+        }
+
+        foreach (var g in activos.GroupBy(x => (x.nombre ?? "").Trim().ToUpperInvariant()).Where(g => !string.IsNullOrWhiteSpace(g.Key)).ToList())
+        {
+            foreach (string wanted in new[] { "ARRIBA", "ABAJO" })
+            {
+                if (g.Any(x => string.Equals(x.sector, wanted, StringComparison.OrdinalIgnoreCase))) continue;
+                var src = g.First();
+                await using var clone = new MySqlCommand("""
+                    INSERT INTO productos
+                    (sucursal_id,sector,nombre,categoria,tipo_entrada,unidad_base,unidades_por_entrada,precio_compra,
+                     stock_actual,stock_minimo,estado,genera_comision,tipo_comision,valor_comision,sin_limite_stock,rendimiento_vaso)
+                    SELECT sucursal_id,@sector,nombre,categoria,tipo_entrada,unidad_base,unidades_por_entrada,precio_compra,
+                           0,stock_minimo,estado,genera_comision,tipo_comision,valor_comision,sin_limite_stock,rendimiento_vaso
+                    FROM productos WHERE id=@src;
+                    SELECT LAST_INSERT_ID();
+                """, con, tx);
+                clone.Parameters.AddWithValue("@sector", wanted);
+                clone.Parameters.AddWithValue("@src", src.id);
+                long dst = Convert.ToInt64(await clone.ExecuteScalarAsync());
+
+                await using var copyPres = new MySqlCommand("""
+                    INSERT INTO presentaciones(producto_id,nombre,cantidad_base,precio_venta,estado)
+                    SELECT @dst,nombre,cantidad_base,precio_venta,estado FROM presentaciones WHERE producto_id=@src
+                    ON DUPLICATE KEY UPDATE cantidad_base=VALUES(cantidad_base),precio_venta=VALUES(precio_venta),estado=VALUES(estado);
+                """, con, tx);
+                copyPres.Parameters.AddWithValue("@dst", dst);
+                copyPres.Parameters.AddWithValue("@src", src.id);
+                await copyPres.ExecuteNonQueryAsync();
+            }
+        }
+        await tx.CommitAsync();
+    }
+    catch
+    {
+        await tx.RollbackAsync();
+        throw;
+    }
+}
+
 static async Task EnsurePremiumSectorStockAsync(MySqlConnection con)
 {
     // V76: un solo catálogo lógico para PREMIU, pero existencias físicas separadas ARRIBA/ABAJO.
@@ -5674,7 +5731,14 @@ static async Task EnsurePremiumSectorStockAsync(MySqlConnection con)
 
     await using (var check = new MySqlCommand("SELECT COUNT(*) FROM migraciones_sistema WHERE clave='PREMIU_STOCK_SECTOR_V76';", con))
     {
-        if (Convert.ToInt32(await check.ExecuteScalarAsync() ?? 0) > 0) return;
+        if (Convert.ToInt32(await check.ExecuteScalarAsync() ?? 0) > 0)
+        {
+            // V83: aunque la migración ya exista, reparar cualquier producto nuevo/antiguo
+            // que tenga ficha en un solo sector. La ficha hermana se crea con stock 0,
+            // por lo que nunca se infla el inventario existente.
+            await EnsurePremiumSectorPairsAsync(con);
+            return;
+        }
     }
 
     await using var tx = await con.BeginTransactionAsync();
@@ -5763,10 +5827,11 @@ static async Task EnsurePremiumSectorStockAsync(MySqlConnection con)
         await using (var mark = new MySqlCommand("INSERT INTO migraciones_sistema(clave) VALUES('PREMIU_STOCK_SECTOR_V76');", con, tx))
             await mark.ExecuteNonQueryAsync();
         await tx.CommitAsync();
+        await EnsurePremiumSectorPairsAsync(con);
     }
     catch
     {
-        await tx.RollbackAsync();
+        try { await tx.RollbackAsync(); } catch { }
         throw;
     }
 }
