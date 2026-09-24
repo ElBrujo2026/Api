@@ -5880,12 +5880,24 @@ static async Task MirrorPremiumCatalogAsync(MySqlConnection con, MySqlTransactio
 
 static async Task EnsurePremiumSectorPairsAsync(MySqlConnection con)
 {
-    // V83: un catálogo lógico, dos existencias físicas. Si un producto activo existe
-    // solo en ARRIBA o solo en ABAJO, crea la ficha hermana con stock 0 y copia precios.
-    // Nunca suma ni copia el stock del otro sector.
+    // V88: un catálogo lógico, dos existencias físicas. También repara nombres de sector
+    // heredados (GENERAL, COMPARTIDO, CAJA ARRIBA/ABAJO) antes de crear la ficha hermana.
+    // La normalización conserva la cantidad en su sector de origen conservador y la ficha
+    // faltante SIEMPRE nace con stock 0, evitando cualquier inflación.
     await using var tx = await con.BeginTransactionAsync();
     try
     {
+        await using (var normalize = new MySqlCommand("""
+            UPDATE productos
+            SET sector = CASE
+                WHEN UPPER(TRIM(COALESCE(sector,''))) LIKE '%ARRIBA%' THEN 'ARRIBA'
+                WHEN UPPER(TRIM(COALESCE(sector,''))) LIKE '%ABAJO%' OR UPPER(TRIM(COALESCE(sector,''))) LIKE '%BAJO%' THEN 'ABAJO'
+                WHEN UPPER(TRIM(COALESCE(sector,''))) IN ('GENERAL','COMPARTIDO','') THEN 'ABAJO'
+                ELSE sector
+            END
+            WHERE sucursal_id=2 AND estado='ACTIVO';
+        """, con, tx)) await normalize.ExecuteNonQueryAsync();
+
         var activos = new List<(long id, string nombre, string sector)>();
         await using (var q = new MySqlCommand("SELECT id,nombre,sector FROM productos WHERE sucursal_id=2 AND estado='ACTIVO' AND sector IN ('ARRIBA','ABAJO') ORDER BY id FOR UPDATE;", con, tx))
         await using (var rd = await q.ExecuteReaderAsync())
