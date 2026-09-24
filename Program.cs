@@ -3313,8 +3313,10 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
     await using var con = await db.OpenAsync();
     await EnsureShiftCloseTables(con);
 
+    // V87: aun si llega un cliente antiguo sin sync_key, la identidad de respaldo incluye CAJA.
+    // De este modo ARRIBA y ABAJO nunca chocan por compartir usuario/turno/fecha.
     string syncKey = string.IsNullOrWhiteSpace(r.SyncKey)
-        ? "CIERRE-" + r.SucursalId + "-" + (r.CajeroUsuario ?? "") + "-" + r.Inicio.Ticks
+        ? "CIERRE-" + r.SucursalId + "-" + (r.Caja ?? "").Trim().ToUpperInvariant().Replace(" ", "") + "-" + (r.CajeroUsuario ?? "") + "-" + r.Inicio.Ticks
         : r.SyncKey.Trim();
 
     // V86: identidad NATURAL del cierre. Aunque una PC reintente con otra sync_key,
@@ -3363,6 +3365,7 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
                        ELSE 0 END),0) AS mesas_total,
                    COALESCE(SUM(v.total),0) AS total
             FROM ventas_canonicas v
+            LEFT JOIN usuarios u ON u.usuario = v.cajero AND u.sucursal_id = v.sucursal_id
             LEFT JOIN (
                 SELECT venta_id, SUM(subtotal) AS detalle_total
                 FROM detalle_ventas_canonico
@@ -3370,6 +3373,10 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
             ) dt ON dt.venta_id = v.id
             WHERE v.sucursal_id = @sucursal_id
               AND v.cajero = @cajero
+              AND UPPER(TRIM(CASE
+                    WHEN v.sucursal_id=1 THEN 'CAJA ÚNICA'
+                    ELSE COALESCE(NULLIF(v.caja_nombre,''), NULLIF(u.caja_nombre,''), '')
+                  END)) = UPPER(TRIM(@caja))
               AND UPPER(COALESCE(NULLIF(v.turno,''), CASE
                     WHEN TIME(v.fecha) >= '08:00:00' AND TIME(v.fecha) < '20:00:00' THEN 'MAÑANA'
                     ELSE 'NOCHE' END)) = @turno
@@ -3377,6 +3384,7 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
         """, con);
         reconcile.Parameters.AddWithValue("@sucursal_id", r.SucursalId);
         reconcile.Parameters.AddWithValue("@cajero", r.CajeroUsuario ?? "");
+        reconcile.Parameters.AddWithValue("@caja", r.SucursalId == 1 ? "CAJA ÚNICA" : (r.Caja ?? ""));
         reconcile.Parameters.AddWithValue("@turno", NormalizarTurno(r.Turno));
         reconcile.Parameters.AddWithValue("@inicio", r.Inicio);
         reconcile.Parameters.AddWithValue("@fin", r.Fin);
