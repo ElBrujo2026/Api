@@ -80,7 +80,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
         return Results.Ok(new
         {
             ok = true,
-            version = "V84_STOCK_ANTIINFLACION_V167",
+            version = "V86_CIERRE_UNICO_STOCK_REMOTO",
             database,
             mysql = "conectado",
             googleSheets = sheets.IsConfigured ? "configurado" : "faltan variables GOOGLE_SHEET_ID y GOOGLE_CREDENTIALS_JSON",
@@ -98,10 +98,10 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
 app.MapGet("/api/system/version", () => Results.Ok(new
 {
     ok = true,
-    apiVersion = "V84_STOCK_ANTIINFLACION_V167",
+    apiVersion = "V86_CIERRE_UNICO_STOCK_REMOTO",
     minimumClientVersion = 167,
     accountingMode = "LIBRO_INMUTABLE_TRANSACCIONAL",
-    message = "API V84. Sincronización anti-inflación de stock; requiere Caja V167 o superior. Conserva mesas dinámicas, catálogo Premium, promociones, combos y anti-duplicado."
+    message = "API V86. Cierre de turno idempotente por identidad natural + stock remoto por ID; requiere Caja V170 o superior para relevo robusto. Conserva anti-inflación, mesas dinámicas, catálogo Premium, promociones y combos."
 }));
 
 app.MapGet("/api/sheets/status", async (SheetsReporter sheets) =>
@@ -3317,6 +3317,18 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
         ? "CIERRE-" + r.SucursalId + "-" + (r.CajeroUsuario ?? "") + "-" + r.Inicio.Ticks
         : r.SyncKey.Trim();
 
+    // V86: identidad NATURAL del cierre. Aunque una PC reintente con otra sync_key,
+    // el mismo cajero/caja/turno/ventana solo puede tener un cierre en Railway.
+    string closeIdentity = string.Join("|", new[]
+    {
+        r.SucursalId.ToString(),
+        (r.CajeroUsuario ?? "").Trim().ToUpperInvariant(),
+        (r.Caja ?? "").Trim().ToUpperInvariant(),
+        NormalizarTurno(r.Turno),
+        r.Inicio.ToString("yyyyMMddHHmmss", System.Globalization.CultureInfo.InvariantCulture)
+    });
+    string cierreKey = "NAT-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(closeIdentity))).ToLowerInvariant();
+
     // V56: el servidor vuelve a calcular el dinero del arqueo usando el libro canónico de VENTAS.
     // Así un cierre local desactualizado no puede dejar Bs. 0 si Railway ya tiene ventas confirmadas.
     int canonicalTransactions = Math.Max(0, r.TransaccionesTotal);
@@ -3390,6 +3402,56 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
     }
     catch { /* si aún no llegaron ventas al servidor, se conserva la fotografía enviada por la caja */ }
 
+    // V86: si este cierre ya existe por identidad natural, adoptar su sync_key ANTES del upsert.
+    // Esto cubre datos históricos y evita que dos claves distintas del mismo turno creen filas separadas.
+    try
+    {
+        await using var existingClose = new MySqlCommand("""
+            SELECT id, sync_key, cierre_key
+            FROM cierres_turno
+            WHERE sucursal_id=@sid
+              AND UPPER(TRIM(cajero_usuario))=UPPER(TRIM(@cajero))
+              AND UPPER(TRIM(COALESCE(caja,'')))=UPPER(TRIM(@caja))
+              AND UPPER(TRIM(turno))=UPPER(TRIM(@turno))
+              AND inicio=@inicio
+            ORDER BY id
+            LIMIT 1;
+        """, con);
+        existingClose.Parameters.AddWithValue("@sid", r.SucursalId);
+        existingClose.Parameters.AddWithValue("@cajero", r.CajeroUsuario ?? "");
+        existingClose.Parameters.AddWithValue("@caja", r.Caja ?? "");
+        existingClose.Parameters.AddWithValue("@turno", NormalizarTurno(r.Turno));
+        existingClose.Parameters.AddWithValue("@inicio", r.Inicio);
+        long existingId = 0;
+        string existingKey = "";
+        string existingNatural = "";
+        await using (var er = await existingClose.ExecuteReaderAsync())
+        {
+            if (await er.ReadAsync())
+            {
+                existingId = er.GetInt64(0);
+                existingKey = er.IsDBNull(1) ? "" : er.GetString(1);
+                existingNatural = er.IsDBNull(2) ? "" : er.GetString(2);
+            }
+        }
+        if (existingId > 0)
+        {
+            if (!string.IsNullOrWhiteSpace(existingKey)) syncKey = existingKey;
+            if (string.IsNullOrWhiteSpace(existingNatural))
+            {
+                try
+                {
+                    await using var markNatural = new MySqlCommand("UPDATE cierres_turno SET cierre_key=@k WHERE id=@id AND (cierre_key IS NULL OR TRIM(cierre_key)='');", con);
+                    markNatural.Parameters.AddWithValue("@k", cierreKey);
+                    markNatural.Parameters.AddWithValue("@id", existingId);
+                    await markNatural.ExecuteNonQueryAsync();
+                }
+                catch { }
+            }
+        }
+    }
+    catch { }
+
     const string sql = """
         INSERT INTO cierres_turno
         (
@@ -3400,7 +3462,7 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
             efectivo, qr, tarjeta, transferencia, sin_metodo,
             productos_total, mesas_total, minutos_jugados, propinas_total,
             cortesias_valor, comisiones_total, gastos_total, perdidas_total,
-            total_generado, neto_turno, observaciones, detalle_json, sync_key
+            total_generado, neto_turno, observaciones, detalle_json, cierre_key, sync_key
         )
         VALUES
         (
@@ -3411,7 +3473,7 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
             @efectivo, @qr, @tarjeta, @transferencia, @sin_metodo,
             @productos_total, @mesas_total, @minutos_jugados, @propinas_total,
             @cortesias_valor, @comisiones_total, @gastos_total, @perdidas_total,
-            @total_generado, @neto_turno, @observaciones, @detalle_json, @sync_key
+            @total_generado, @neto_turno, @observaciones, @detalle_json, @cierre_key, @sync_key
         )
         ON DUPLICATE KEY UPDATE
             fecha_cierre = VALUES(fecha_cierre),
@@ -3437,7 +3499,7 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
             neto_turno = VALUES(neto_turno),
             observaciones = VALUES(observaciones),
             detalle_json = VALUES(detalle_json),
-            sync_key = VALUES(sync_key);
+            cierre_key = VALUES(cierre_key);
     """;
 
     await using (var cmd = new MySqlCommand(sql, con))
@@ -3474,19 +3536,27 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
         cmd.Parameters.AddWithValue("@neto_turno", reconciledFromSales ? canonicalTotal - Math.Max(0, r.GastosTotal) : r.NetoTurno);
         cmd.Parameters.AddWithValue("@observaciones", r.Observaciones ?? "");
         cmd.Parameters.AddWithValue("@detalle_json", string.IsNullOrWhiteSpace(r.DetalleJson) ? "[]" : r.DetalleJson);
+        cmd.Parameters.AddWithValue("@cierre_key", cierreKey);
         cmd.Parameters.AddWithValue("@sync_key", syncKey);
         await cmd.ExecuteNonQueryAsync();
     }
 
-    long id;
-    await using (var idCmd = new MySqlCommand("SELECT id FROM cierres_turno WHERE sync_key=@sync_key LIMIT 1;", con))
+    long id = 0;
+    string canonicalSyncKey = syncKey;
+    await using (var idCmd = new MySqlCommand("SELECT id, sync_key FROM cierres_turno WHERE cierre_key=@cierre_key OR sync_key=@sync_key ORDER BY id LIMIT 1;", con))
     {
+        idCmd.Parameters.AddWithValue("@cierre_key", cierreKey);
         idCmd.Parameters.AddWithValue("@sync_key", syncKey);
-        id = Convert.ToInt64(await idCmd.ExecuteScalarAsync() ?? 0L);
+        await using var idRd = await idCmd.ExecuteReaderAsync();
+        if (await idRd.ReadAsync())
+        {
+            id = idRd.GetInt64(0);
+            canonicalSyncKey = idRd.IsDBNull(1) ? syncKey : idRd.GetString(1);
+        }
     }
 
     await TrySyncSheets(db, sheets);
-    return Results.Ok(new { ok = true, id, syncKey, reconciledFromSales, canonicalTransactions, canonicalCash, canonicalQr, canonicalTransfer, canonicalTotal, message = reconciledFromSales ? "Arqueo guardado y conciliado contra ventas únicas de Railway, incluida transferencia." : "Arqueo guardado para Administración." });
+    return Results.Ok(new { ok = true, id, syncKey = canonicalSyncKey, cierreKey, idempotent = !string.Equals(canonicalSyncKey, syncKey, StringComparison.OrdinalIgnoreCase), reconciledFromSales, canonicalTransactions, canonicalCash, canonicalQr, canonicalTransfer, canonicalTotal, message = reconciledFromSales ? "Arqueo guardado y conciliado contra ventas únicas de Railway, incluida transferencia." : "Arqueo guardado para Administración." });
 });
 
 app.MapGet("/api/admin/cierres-turno", async (Db db, string clave, int? sucursalId) =>
@@ -3533,13 +3603,21 @@ app.MapGet("/api/admin/cierres-turno", async (Db db, string clave, int? sucursal
             neto_turno,
             observaciones,
             detalle_json
-        FROM cierres_turno
+        FROM cierres_turno c
+        WHERE c.id = (
+            SELECT MIN(c2.id) FROM cierres_turno c2
+            WHERE c2.sucursal_id=c.sucursal_id
+              AND UPPER(TRIM(c2.cajero_usuario))=UPPER(TRIM(c.cajero_usuario))
+              AND UPPER(TRIM(COALESCE(c2.caja,'')))=UPPER(TRIM(COALESCE(c.caja,'')))
+              AND UPPER(TRIM(c2.turno))=UPPER(TRIM(c.turno))
+              AND c2.inicio=c.inicio
+        )
     """;
 
     if (sucursalId.HasValue && sucursalId.Value > 0)
-        sql += " WHERE sucursal_id = @sucursal_id";
+        sql += " AND c.sucursal_id = @sucursal_id";
 
-    sql += " ORDER BY fecha_cierre DESC, id DESC;";
+    sql += " ORDER BY c.fecha_cierre DESC, c.id DESC;";
 
     await using var cmd = new MySqlCommand(sql, con);
     if (sucursalId.HasValue && sucursalId.Value > 0)
@@ -3692,6 +3770,14 @@ app.MapPost("/api/admin/reportes/consulta", async (Db db, AdminReportQueryReques
                c.total_generado, c.neto_turno, c.observaciones
         FROM cierres_turno c
         WHERE c.sucursal_id=@sucursal_id
+          AND c.id = (
+              SELECT MIN(c2.id) FROM cierres_turno c2
+              WHERE c2.sucursal_id=c.sucursal_id
+                AND UPPER(TRIM(c2.cajero_usuario))=UPPER(TRIM(c.cajero_usuario))
+                AND UPPER(TRIM(COALESCE(c2.caja,'')))=UPPER(TRIM(COALESCE(c.caja,'')))
+                AND UPPER(TRIM(c2.turno))=UPPER(TRIM(c.turno))
+                AND c2.inicio=c.inicio
+          )
           AND DATE(COALESCE(c.inicio,c.fecha_cierre)) BETWEEN @desde AND @hasta
           AND (@turno='' OR UPPER(COALESCE(c.turno,''))=@turno)
           AND (@sector='' OR UPPER(CASE WHEN c.sucursal_id=1 THEN 'GENERAL'
@@ -3788,6 +3874,8 @@ app.MapPost("/api/admin/inventario/consulta", async (Db db, AdminInventoryQueryR
         SELECT MIN(p.nombre) AS producto,
                MIN(p.categoria) AS categoria,
                MIN(p.unidad_base) AS unidad_base,
+               MAX(CASE WHEN p.sector='ARRIBA' THEN p.id ELSE 0 END) AS producto_id_arriba,
+               MAX(CASE WHEN p.sector='ABAJO' THEN p.id ELSE 0 END) AS producto_id_abajo,
                MAX(CASE WHEN p.sector='ARRIBA' THEN p.stock_actual ELSE 0 END) AS stock_arriba,
                MAX(CASE WHEN p.sector='ABAJO' THEN p.stock_actual ELSE 0 END) AS stock_abajo,
                MAX(CASE WHEN p.sector='ARRIBA' THEN p.stock_actual ELSE 0 END)
@@ -3807,7 +3895,7 @@ app.MapPost("/api/admin/inventario/consulta", async (Db db, AdminInventoryQueryR
         GROUP BY LOWER(TRIM(p.nombre))
         ORDER BY categoria, producto;
     """ : """
-        SELECT p.nombre AS producto,p.categoria,p.unidad_base,
+        SELECT p.id AS producto_id,p.nombre AS producto,p.categoria,p.unidad_base,
                p.stock_actual AS stock_actual,
                COALESCE(SUM(CASE WHEN m.delta>0 THEN m.delta ELSE 0 END),0) AS entradas_total,
                p.stock_minimo,COALESCE(p.sin_limite_stock,0) AS sin_limite_stock,
@@ -3831,6 +3919,125 @@ app.MapPost("/api/admin/inventario/consulta", async (Db db, AdminInventoryQueryR
         nota=sid==2?"Un solo catálogo; ARRIBA y ABAJO tienen cantidades independientes.":"Inventario GENERAL de EL BRUJO.",
         items
     });
+});
+
+// V85: reposición remota idempotente desde la App Administrador.
+// Cada operation_key puede aplicarse una sola vez, incluso si el celular reintenta por mala señal.
+app.MapPost("/api/admin/inventario/reponer", async (Db db, AdminInventoryAdjustRequest req) =>
+{
+    await using var con = await db.OpenAsync();
+    await EnsureAppMeseraTables(con);
+    await EnsureSectorLayoutAsync(con);
+    await EnsurePremiumSectorStockAsync(con);
+    if (!await ValidarAdministradorAsync(con, req.Usuario, req.Clave)) return Results.Unauthorized();
+
+    int sid = req.SucursalId == 2 ? 2 : 1;
+    string producto = (req.Producto ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(producto)) return Results.BadRequest(new { ok=false, message="Selecciona un producto." });
+    if (req.Cantidad <= 0 || req.Cantidad > 100000m) return Results.BadRequest(new { ok=false, message="Cantidad inválida." });
+
+    string sector = sid == 2 ? NormalizarSector(2, req.Sector) : "GENERAL";
+    string operationKey = string.IsNullOrWhiteSpace(req.OperationKey)
+        ? "APPSTOCK-" + Guid.NewGuid().ToString("N")
+        : req.OperationKey.Trim();
+    if (operationKey.Length > 100) operationKey = operationKey[..100];
+    string motivo = string.IsNullOrWhiteSpace(req.Motivo) ? "REPOSICION APP ADMIN" : req.Motivo.Trim();
+    if (motivo.Length > 200) motivo = motivo[..200];
+
+    await using (var create = new MySqlCommand("""
+        CREATE TABLE IF NOT EXISTS movimientos_inventario_admin (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            operation_key VARCHAR(100) NOT NULL,
+            sucursal_id INT NOT NULL,
+            sector VARCHAR(20) NOT NULL DEFAULT 'GENERAL',
+            producto_id BIGINT NOT NULL,
+            delta DECIMAL(14,4) NOT NULL,
+            motivo VARCHAR(200) NULL,
+            fecha DATETIME NOT NULL,
+            UNIQUE KEY uk_mov_inv_admin_operation (operation_key)
+        );
+    """, con)) await create.ExecuteNonQueryAsync();
+
+    await using var tx = await con.BeginTransactionAsync();
+    try
+    {
+        long productoId = 0;
+        decimal stockAntes = 0m;
+        string nombreReal = producto;
+        string lookupSql = req.ProductoId.HasValue && req.ProductoId.Value > 0
+            ? """
+              SELECT id, nombre, stock_actual
+              FROM productos
+              WHERE id=@pid AND sucursal_id=@sid AND sector=@sector AND estado='ACTIVO'
+              LIMIT 1
+              FOR UPDATE;
+              """
+            : """
+              SELECT id, nombre, stock_actual
+              FROM productos
+              WHERE sucursal_id=@sid AND sector=@sector AND estado='ACTIVO'
+                AND LOWER(TRIM(nombre))=LOWER(TRIM(@nombre))
+              ORDER BY id
+              LIMIT 1
+              FOR UPDATE;
+              """;
+        await using (var q = new MySqlCommand(lookupSql, con, tx))
+        {
+            q.Parameters.AddWithValue("@sid", sid);
+            q.Parameters.AddWithValue("@sector", sector);
+            if (req.ProductoId.HasValue && req.ProductoId.Value > 0)
+                q.Parameters.AddWithValue("@pid", req.ProductoId.Value);
+            else
+                q.Parameters.AddWithValue("@nombre", producto);
+            await using var rr = await q.ExecuteReaderAsync();
+            if (await rr.ReadAsync())
+            {
+                productoId = Convert.ToInt64(rr["id"]);
+                nombreReal = rr.IsDBNull(rr.GetOrdinal("nombre")) ? producto : rr.GetString("nombre");
+                stockAntes = Convert.ToDecimal(rr["stock_actual"]);
+            }
+        }
+        if (productoId <= 0)
+            throw new InvalidOperationException("Producto no encontrado en " + (sid == 2 ? sector : "EL BRUJO") + ". Actualiza el inventario e inténtalo nuevamente.");
+
+        int movementInserted;
+        await using (var mv = new MySqlCommand("""
+            INSERT IGNORE INTO movimientos_inventario_admin
+            (operation_key,sucursal_id,sector,producto_id,delta,motivo,fecha)
+            VALUES(@k,@sid,@sector,@pid,@delta,@motivo,NOW());
+        """, con, tx))
+        {
+            mv.Parameters.AddWithValue("@k", operationKey);
+            mv.Parameters.AddWithValue("@sid", sid);
+            mv.Parameters.AddWithValue("@sector", sector);
+            mv.Parameters.AddWithValue("@pid", productoId);
+            mv.Parameters.AddWithValue("@delta", req.Cantidad);
+            mv.Parameters.AddWithValue("@motivo", motivo);
+            movementInserted = await mv.ExecuteNonQueryAsync();
+        }
+
+        if (movementInserted == 0)
+        {
+            await tx.CommitAsync();
+            return Results.Ok(new { ok=true, idempotent=true, operationKey, producto=nombreReal, productoId, sector, cantidad=req.Cantidad, message="Esta reposición ya había sido aplicada. No se volvió a sumar stock." });
+        }
+
+        await using (var up = new MySqlCommand("UPDATE productos SET stock_actual=stock_actual+@q WHERE id=@id;", con, tx))
+        {
+            up.Parameters.AddWithValue("@q", req.Cantidad);
+            up.Parameters.AddWithValue("@id", productoId);
+            if (await up.ExecuteNonQueryAsync() != 1) throw new InvalidOperationException("No se pudo actualizar el inventario.");
+        }
+
+        await tx.CommitAsync();
+        decimal stockDespues = stockAntes + req.Cantidad;
+        return Results.Ok(new { ok=true, idempotent=false, operationKey, producto=nombreReal, productoId, sector, cantidad=req.Cantidad, stockAntes, stockDespues, message="Stock actualizado correctamente." });
+    }
+    catch (Exception ex)
+    {
+        try { await tx.RollbackAsync(); } catch { }
+        return Results.BadRequest(new { ok=false, message=ex.Message });
+    }
 });
 
 app.MapPost("/api/admin/inventario/transferir", async (Db db, AdminInventoryTransferRequest req) =>
@@ -6397,7 +6604,9 @@ static async Task EnsureShiftCloseTables(MySqlConnection con)
             neto_turno DECIMAL(12,2) NOT NULL DEFAULT 0,
             observaciones TEXT NULL,
             detalle_json LONGTEXT NOT NULL,
+            cierre_key VARCHAR(190) NULL,
             sync_key VARCHAR(220) NOT NULL,
+            UNIQUE KEY uk_cierre_turno_natural (cierre_key),
             UNIQUE KEY uk_cierre_turno_sync (sync_key),
             INDEX idx_cierre_turno_fecha (fecha_cierre),
             INDEX idx_cierre_turno_sucursal (sucursal_id),
@@ -6405,6 +6614,29 @@ static async Task EnsureShiftCloseTables(MySqlConnection con)
         );
     """, con);
     await cmd.ExecuteNonQueryAsync();
+
+    // V86: migración sin borrar historial. Si ya había cierres duplicados, solo el primer
+    // registro de cada identidad natural recibe cierre_key; los duplicados históricos quedan
+    // intactos pero ya no se vuelven a crear y los reportes los filtran.
+    try { await new MySqlCommand("ALTER TABLE cierres_turno ADD COLUMN cierre_key VARCHAR(190) NULL AFTER detalle_json;", con).ExecuteNonQueryAsync(); } catch { }
+    try
+    {
+        await using var backfill = new MySqlCommand("""
+            UPDATE cierres_turno c
+            INNER JOIN (
+                SELECT MIN(id) AS keep_id
+                FROM cierres_turno
+                GROUP BY sucursal_id, UPPER(TRIM(cajero_usuario)), UPPER(TRIM(COALESCE(caja,''))), UPPER(TRIM(turno)), inicio
+            ) k ON k.keep_id=c.id
+            SET c.cierre_key = CONCAT('NAT-', LOWER(SHA2(CONCAT_WS('|',
+                c.sucursal_id, UPPER(TRIM(c.cajero_usuario)), UPPER(TRIM(COALESCE(c.caja,''))),
+                UPPER(TRIM(c.turno)), DATE_FORMAT(c.inicio,'%Y%m%d%H%i%s')),256)))
+            WHERE c.cierre_key IS NULL OR TRIM(c.cierre_key)='';
+        """, con);
+        await backfill.ExecuteNonQueryAsync();
+    }
+    catch { }
+    try { await new MySqlCommand("CREATE UNIQUE INDEX uk_cierre_turno_natural ON cierres_turno(cierre_key);", con).ExecuteNonQueryAsync(); } catch { }
 }
 
 static async Task EnsureOfficialBranchAndTableLayout(MySqlConnection con)
@@ -7447,6 +7679,18 @@ public sealed record AdminInventoryQueryRequest(
     string Usuario,
     string Clave,
     int SucursalId
+);
+
+public sealed record AdminInventoryAdjustRequest(
+    string Usuario,
+    string Clave,
+    int SucursalId,
+    string Producto,
+    long? ProductoId,
+    string? Sector,
+    decimal Cantidad,
+    string? Motivo,
+    string? OperationKey
 );
 
 public sealed record AdminInventoryTransferRequest(
