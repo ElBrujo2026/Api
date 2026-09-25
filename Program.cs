@@ -101,7 +101,7 @@ app.MapGet("/api/system/version", () => Results.Ok(new
     apiVersion = "V86_CIERRE_UNICO_STOCK_REMOTO",
     minimumClientVersion = 167,
     accountingMode = "LIBRO_INMUTABLE_TRANSACCIONAL",
-    message = "API V86. Cierre de turno idempotente por identidad natural + stock remoto por ID; requiere Caja V170 o superior para relevo robusto. Conserva anti-inflación, mesas dinámicas, catálogo Premium, promociones y combos."
+    message = "API V89. Reapertura segura de turnos por Administrador + cierre idempotente por caja + stock remoto. Conserva historial, ventas, anti-inflación, catálogo Premium y promociones."
 }));
 
 app.MapGet("/api/sheets/status", async (SheetsReporter sheets) =>
@@ -3470,7 +3470,7 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
             efectivo, qr, tarjeta, transferencia, sin_metodo,
             productos_total, mesas_total, minutos_jugados, propinas_total,
             cortesias_valor, comisiones_total, gastos_total, perdidas_total,
-            total_generado, neto_turno, observaciones, detalle_json, cierre_key, sync_key
+            total_generado, neto_turno, observaciones, detalle_json, estado, cierre_key, sync_key
         )
         VALUES
         (
@@ -3481,7 +3481,7 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
             @efectivo, @qr, @tarjeta, @transferencia, @sin_metodo,
             @productos_total, @mesas_total, @minutos_jugados, @propinas_total,
             @cortesias_valor, @comisiones_total, @gastos_total, @perdidas_total,
-            @total_generado, @neto_turno, @observaciones, @detalle_json, @cierre_key, @sync_key
+            @total_generado, @neto_turno, @observaciones, @detalle_json, 'CERRADO', @cierre_key, @sync_key
         )
         ON DUPLICATE KEY UPDATE
             fecha_cierre = VALUES(fecha_cierre),
@@ -3507,6 +3507,13 @@ app.MapPost("/api/cierres-turno", async (Db db, SheetsReporter sheets, ShiftClos
             neto_turno = VALUES(neto_turno),
             observaciones = VALUES(observaciones),
             detalle_json = VALUES(detalle_json),
+            estado = CASE
+                WHEN cierres_turno.estado='REABIERTO'
+                     AND cierres_turno.ultima_reapertura IS NOT NULL
+                     AND VALUES(fecha_cierre) <= cierres_turno.ultima_reapertura
+                THEN 'REABIERTO'
+                ELSE 'CERRADO'
+            END,
             cierre_key = VALUES(cierre_key);
     """;
 
@@ -3610,7 +3617,12 @@ app.MapGet("/api/admin/cierres-turno", async (Db db, string clave, int? sucursal
             total_generado,
             neto_turno,
             observaciones,
-            detalle_json
+            detalle_json,
+            COALESCE(estado,'CERRADO') AS estado,
+            COALESCE(reapertura_count,0) AS reapertura_count,
+            ultima_reapertura,
+            COALESCE(reabierto_por,'') AS reabierto_por,
+            COALESCE(motivo_reapertura,'') AS motivo_reapertura
         FROM cierres_turno c
         WHERE c.id = (
             SELECT MIN(c2.id) FROM cierres_turno c2
@@ -3642,6 +3654,96 @@ app.MapGet("/api/admin/cierres-turno", async (Db db, string clave, int? sucursal
     }
 
     return Results.Ok(rows);
+});
+
+
+// V89: reapertura administrativa segura.
+// NO borra ventas ni arqueos. Marca el cierre como REABIERTO y deja auditoría.
+app.MapPost("/api/admin/cierres-turno/reabrir", async (Db db, string clave, ReopenShiftRequest req) =>
+{
+    const string adminKey = "ENTREGAR_LIMPIO_2026";
+    if (clave != adminKey) return Results.Unauthorized();
+
+    string caja = req.SucursalId == 1 ? "CAJA ÚNICA" : (req.Caja ?? "").Trim();
+    if (req.SucursalId <= 0 ||
+        string.IsNullOrWhiteSpace(caja) ||
+        string.IsNullOrWhiteSpace(req.Turno) ||
+        string.IsNullOrWhiteSpace(req.CajeroUsuario) ||
+        req.Inicio == DateTime.MinValue)
+        return Results.BadRequest(new { ok = false, message = "Faltan datos para identificar exactamente el turno." });
+
+    string motivo = (req.Motivo ?? "").Trim();
+    if (motivo.Length < 5)
+        return Results.BadRequest(new { ok = false, message = "Escribe un motivo de reapertura de al menos 5 caracteres." });
+
+    string adminUsuario = string.IsNullOrWhiteSpace(req.AdminUsuario) ? "ADMIN" : req.AdminUsuario.Trim();
+
+    await using var con = await db.OpenAsync();
+    await EnsureShiftCloseTables(con);
+
+    // Buscar primero por ID online si está disponible; si no, usar la identidad natural exacta.
+    long cierreId = 0;
+    string estadoActual = "";
+    await using (var find = new MySqlCommand("""
+        SELECT id, COALESCE(estado,'CERRADO') AS estado
+        FROM cierres_turno
+        WHERE (
+                @id > 0 AND id=@id
+              )
+           OR (
+                sucursal_id=@sid
+                AND UPPER(TRIM(COALESCE(caja,'')))=UPPER(TRIM(@caja))
+                AND UPPER(TRIM(turno))=UPPER(TRIM(@turno))
+                AND UPPER(TRIM(cajero_usuario))=UPPER(TRIM(@cajero))
+                AND inicio=@inicio
+              )
+        ORDER BY CASE WHEN id=@id THEN 0 ELSE 1 END, id
+        LIMIT 1;
+    """, con))
+    {
+        find.Parameters.AddWithValue("@id", Math.Max(0, req.CierreId));
+        find.Parameters.AddWithValue("@sid", req.SucursalId);
+        find.Parameters.AddWithValue("@caja", caja);
+        find.Parameters.AddWithValue("@turno", NormalizarTurno(req.Turno));
+        find.Parameters.AddWithValue("@cajero", req.CajeroUsuario.Trim());
+        find.Parameters.AddWithValue("@inicio", req.Inicio);
+        await using var rd = await find.ExecuteReaderAsync();
+        if (await rd.ReadAsync())
+        {
+            cierreId = rd.GetInt64(0);
+            estadoActual = rd.IsDBNull(1) ? "CERRADO" : rd.GetString(1);
+        }
+    }
+
+    if (cierreId <= 0)
+        return Results.NotFound(new { ok = false, message = "No se encontró ese cierre. Actualiza la lista de arqueos e inténtalo nuevamente." });
+
+    if (string.Equals(estadoActual, "REABIERTO", StringComparison.OrdinalIgnoreCase))
+        return Results.Ok(new { ok = true, id = cierreId, estado = "REABIERTO", idempotent = true, message = "Ese turno ya estaba reabierto." });
+
+    await using (var upd = new MySqlCommand("""
+        UPDATE cierres_turno
+        SET estado='REABIERTO',
+            reapertura_count=COALESCE(reapertura_count,0)+1,
+            ultima_reapertura=NOW(),
+            reabierto_por=@admin,
+            motivo_reapertura=@motivo
+        WHERE id=@id;
+    """, con))
+    {
+        upd.Parameters.AddWithValue("@admin", adminUsuario);
+        upd.Parameters.AddWithValue("@motivo", motivo);
+        upd.Parameters.AddWithValue("@id", cierreId);
+        await upd.ExecuteNonQueryAsync();
+    }
+
+    return Results.Ok(new
+    {
+        ok = true,
+        id = cierreId,
+        estado = "REABIERTO",
+        message = "Turno reabierto. El arqueo y las ventas se conservaron; el cierre final actualizará el mismo registro."
+    });
 });
 
 
@@ -6624,6 +6726,11 @@ static async Task EnsureShiftCloseTables(MySqlConnection con)
             neto_turno DECIMAL(12,2) NOT NULL DEFAULT 0,
             observaciones TEXT NULL,
             detalle_json LONGTEXT NOT NULL,
+            estado VARCHAR(20) NOT NULL DEFAULT 'CERRADO',
+            reapertura_count INT NOT NULL DEFAULT 0,
+            ultima_reapertura DATETIME NULL,
+            reabierto_por VARCHAR(100) NULL,
+            motivo_reapertura VARCHAR(250) NULL,
             cierre_key VARCHAR(190) NULL,
             sync_key VARCHAR(220) NOT NULL,
             UNIQUE KEY uk_cierre_turno_natural (cierre_key),
@@ -6634,6 +6741,13 @@ static async Task EnsureShiftCloseTables(MySqlConnection con)
         );
     """, con);
     await cmd.ExecuteNonQueryAsync();
+
+    // V89: columnas de reapertura administrativa. No se borra historial.
+    try { await new MySqlCommand("ALTER TABLE cierres_turno ADD COLUMN estado VARCHAR(20) NOT NULL DEFAULT 'CERRADO' AFTER detalle_json;", con).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE cierres_turno ADD COLUMN reapertura_count INT NOT NULL DEFAULT 0 AFTER estado;", con).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE cierres_turno ADD COLUMN ultima_reapertura DATETIME NULL AFTER reapertura_count;", con).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE cierres_turno ADD COLUMN reabierto_por VARCHAR(100) NULL AFTER ultima_reapertura;", con).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE cierres_turno ADD COLUMN motivo_reapertura VARCHAR(250) NULL AFTER reabierto_por;", con).ExecuteNonQueryAsync(); } catch { }
 
     // V86: migración sin borrar historial. Si ya había cierres duplicados, solo el primer
     // registro de cada identidad natural recibe cierre_key; los duplicados históricos quedan
@@ -7878,6 +7992,17 @@ public sealed record ShiftCloseRequest(
     string? Observaciones,
     string? DetalleJson,
     string? SyncKey
+);
+
+public sealed record ReopenShiftRequest(
+    long CierreId,
+    int SucursalId,
+    string? Caja,
+    string? Turno,
+    string? CajeroUsuario,
+    DateTime Inicio,
+    string? AdminUsuario,
+    string? Motivo
 );
 
 public sealed record AdminReportQueryRequest(
