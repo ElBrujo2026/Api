@@ -49,7 +49,10 @@ try
     try { await new MySqlCommand("ALTER TABLE cobros_mesa ADD COLUMN sector VARCHAR(20) NOT NULL DEFAULT 'GENERAL' AFTER caja_nombre;", startupCon).ExecuteNonQueryAsync(); } catch { }
     try { await new MySqlCommand("ALTER TABLE cobros_mesa DROP INDEX uk_cobro_sesion;", startupCon).ExecuteNonQueryAsync(); } catch { }
     try { await new MySqlCommand("UPDATE cobros_mesa SET sector=CASE WHEN sucursal_id=1 THEN 'GENERAL' WHEN UPPER(COALESCE(caja_nombre,'')) LIKE '%ABAJO%' THEN 'ABAJO' ELSE 'ARRIBA' END WHERE sector IS NULL OR TRIM(sector)='' OR (sucursal_id=2 AND UPPER(sector)='GENERAL');", startupCon).ExecuteNonQueryAsync(); } catch { }
-    try { await new MySqlCommand("ALTER TABLE cobros_mesa ADD UNIQUE KEY uk_cobro_sesion_sector (sucursal_id, sector, session_id);", startupCon).ExecuteNonQueryAsync(); } catch { }
+    // V90: SessionId es local a cada PC y NO puede ser una clave global de cobro.
+    try { await new MySqlCommand("ALTER TABLE cobros_mesa ADD COLUMN operation_key VARCHAR(220) NULL AFTER sync_key;", startupCon).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE cobros_mesa DROP INDEX uk_cobro_sesion_sector;", startupCon).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE cobros_mesa ADD UNIQUE KEY uk_cobro_operation_key (operation_key);", startupCon).ExecuteNonQueryAsync(); } catch { }
     // V66: los productos servidos en vaso también manejan cantidad real y deben descontarse.
     await using (var vasoStock = new MySqlCommand("UPDATE productos SET sin_limite_stock=0 WHERE categoria='Servidos en vaso';", startupCon))
         await vasoStock.ExecuteNonQueryAsync();
@@ -80,7 +83,7 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
         return Results.Ok(new
         {
             ok = true,
-            version = "V86_CIERRE_UNICO_STOCK_REMOTO",
+            version = "V90_COBRO_MESA_GLOBAL",
             database,
             mysql = "conectado",
             googleSheets = sheets.IsConfigured ? "configurado" : "faltan variables GOOGLE_SHEET_ID y GOOGLE_CREDENTIALS_JSON",
@@ -98,10 +101,10 @@ app.MapGet("/health", async (Db db, SheetsReporter sheets) =>
 app.MapGet("/api/system/version", () => Results.Ok(new
 {
     ok = true,
-    apiVersion = "V86_CIERRE_UNICO_STOCK_REMOTO",
+    apiVersion = "V90_COBRO_MESA_GLOBAL",
     minimumClientVersion = 167,
     accountingMode = "LIBRO_INMUTABLE_TRANSACCIONAL",
-    message = "API V89. Reapertura segura de turnos por Administrador + cierre idempotente por caja + stock remoto. Conserva historial, ventas, anti-inflación, catálogo Premium y promociones."
+    message = "API V90. Cobro final identificado por OperationKey global; SessionId queda solo como dato informativo. Corrige falsos bloqueos entre PCs/sectores y conserva anti-duplicado real."
 }));
 
 app.MapGet("/api/sheets/status", async (SheetsReporter sheets) =>
@@ -2477,37 +2480,10 @@ app.MapPost("/api/ventas", async (Db db, SheetsReporter sheets, VentaRequest ven
                 return Results.BadRequest(new { ok = false, message = "El mismo producto aparece repetido dentro del pago parcial. Se bloqueó para evitar inflación.", minimumClientVersion = 167 });
         }
 
-        // V48: un cierre final de sesión se contabiliza una sola vez, aunque llegue con otra OperationKey.
-        if (tipoSeguro == "MESA" && venta.SessionId.HasValue)
-        {
-            await using var finalCmd = new MySqlCommand("""
-                SELECT id, sync_key, COALESCE(operation_key,'')
-                FROM ventas
-                WHERE sucursal_id = @sucursal_id
-                  AND session_id = @session_id
-                  AND UPPER(TRIM(tipo)) = 'MESA'
-                  AND UPPER(TRIM(COALESCE(caja_nombre,''))) = UPPER(TRIM(@caja_nombre))
-                ORDER BY id LIMIT 1;
-            """, con, tx);
-            finalCmd.Parameters.AddWithValue("@sucursal_id", venta.SucursalId);
-            finalCmd.Parameters.AddWithValue("@session_id", venta.SessionId.Value);
-            finalCmd.Parameters.AddWithValue("@caja_nombre", venta.CajaNombre ?? "");
-            await using var finalRd = await finalCmd.ExecuteReaderAsync();
-            if (await finalRd.ReadAsync())
-            {
-                long existingFinalId = finalRd.GetInt64(0);
-                string existingSync = finalRd.IsDBNull(1) ? "" : finalRd.GetString(1);
-                string existingOp = finalRd.IsDBNull(2) ? "" : finalRd.GetString(2);
-                if (string.Equals(existingSync, syncKey, StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(existingOp, operationKey, StringComparison.OrdinalIgnoreCase))
-                {
-                    await finalRd.DisposeAsync();
-                    await tx.CommitAsync();
-                    return Results.Ok(new { ok = true, id = existingFinalId, syncKey, operationKey, idempotent = true, sameSessionFinal = true });
-                }
-                return Results.Conflict(new { ok = false, message = "Esta sesión de mesa ya tiene un cobro final confirmado. Se bloqueó un segundo cierre.", sessionId = venta.SessionId, ventaId = existingFinalId });
-            }
-        }
+        // V90: el cierre final se identifica EXCLUSIVAMENTE por OperationKey global.
+        // SessionId es local a cada instalación y puede repetirse en otra PC o sector.
+        // La validación por operation_key ya se ejecutó arriba y conserva la protección
+        // contra doble cobro sin bloquear sesiones distintas por coincidencia numérica.
 
         // V48: una línea de consumo identificada no puede aparecer en dos ventas distintas.
         // Esto evita que un producto pagado parcialmente reaparezca al cierre por una copia online atrasada.
@@ -2927,15 +2903,18 @@ app.MapPost("/api/cobros-mesa", async (Db db, SheetsReporter sheets, CobroMesaRe
             total_cobrado DECIMAL(10,2) NOT NULL DEFAULT 0,
             metodo_pago VARCHAR(50) NOT NULL,
             sync_key VARCHAR(180) NOT NULL UNIQUE,
-            UNIQUE KEY uk_cobro_sesion_sector (sucursal_id, sector, session_id)
+            operation_key VARCHAR(220) NULL,
+            UNIQUE KEY uk_cobro_operation_key (operation_key)
         );
     """, con))
     {
         await create.ExecuteNonQueryAsync();
     }
 
-    // V49: una sesión solo puede tener un cobro de mesa confirmado.
-    try { await new MySqlCommand("ALTER TABLE cobros_mesa ADD UNIQUE KEY uk_cobro_sesion_sector (sucursal_id, sector, session_id);", con).ExecuteNonQueryAsync(); } catch { }
+    // V90: una sesión física se identifica por operation_key, no por SessionId local.
+    try { await new MySqlCommand("ALTER TABLE cobros_mesa ADD COLUMN operation_key VARCHAR(220) NULL AFTER sync_key;", con).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE cobros_mesa DROP INDEX uk_cobro_sesion_sector;", con).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE cobros_mesa ADD UNIQUE KEY uk_cobro_operation_key (operation_key);", con).ExecuteNonQueryAsync(); } catch { }
 
     // V37: el detalle de tiempo ahora incluye modalidad, tiempo real, horas cobradas y tarifa.
     try
@@ -2946,33 +2925,32 @@ app.MapPost("/api/cobros-mesa", async (Db db, SheetsReporter sheets, CobroMesaRe
     catch { }
 
     string syncKey = string.IsNullOrWhiteSpace(c.SyncKey) ? Guid.NewGuid().ToString("N") : c.SyncKey;
+    string operationKey = string.IsNullOrWhiteSpace(c.OperationKey) ? "" : c.OperationKey.Trim();
     string cobroSector = NormalizarSector(c.SucursalId, c.Sector, c.CajaNombre);
 
-    // V49: aunque otra PC o un reintento cambie sync_key, la misma SessionId no puede cobrarse dos veces.
-    if (c.SessionId.HasValue && c.SessionId.Value > 0)
+    // V90: identidad fuerte del cobro de mesa. Dos PCs pueden reutilizar el mismo SessionId,
+    // pero nunca deben compartir la misma OperationKey para sesiones físicas distintas.
+    if (!string.IsNullOrWhiteSpace(operationKey))
     {
-        await using var sameSession = new MySqlCommand("""
-            SELECT id, COALESCE(mesa_id,0), total_mesa, total_consumo, total_cobrado, metodo_pago, sync_key
-            FROM cobros_mesa
-            WHERE sucursal_id=@sucursal_id AND sector=@sector AND session_id=@session_id
-            ORDER BY id LIMIT 1;
+        await using var sameOperation = new MySqlCommand("""
+            SELECT id, sucursal_id, COALESCE(mesa_id,0), total_mesa, total_consumo, total_cobrado, metodo_pago, sync_key
+            FROM cobros_mesa WHERE operation_key=@operation_key LIMIT 1;
         """, con);
-        sameSession.Parameters.AddWithValue("@sucursal_id", c.SucursalId);
-        sameSession.Parameters.AddWithValue("@sector", cobroSector);
-        sameSession.Parameters.AddWithValue("@session_id", c.SessionId.Value);
-        await using var rdSession = await sameSession.ExecuteReaderAsync();
-        if (await rdSession.ReadAsync())
+        sameOperation.Parameters.AddWithValue("@operation_key", operationKey);
+        await using var rdOp = await sameOperation.ExecuteReaderAsync();
+        if (await rdOp.ReadAsync())
         {
-            long idExistente = rdSession.GetInt64(0);
-            bool mismo = rdSession.GetInt32(1) == (c.MesaId ?? 0)
-                && Math.Abs(rdSession.GetDecimal(2) - c.TotalMesa) < 0.01m
-                && Math.Abs(rdSession.GetDecimal(3) - c.TotalConsumo) < 0.01m
-                && Math.Abs(rdSession.GetDecimal(4) - c.TotalCobrado) < 0.01m
-                && string.Equals(rdSession.GetString(5), c.MetodoPago ?? "", StringComparison.OrdinalIgnoreCase);
-            string oldSync = rdSession.IsDBNull(6) ? "" : rdSession.GetString(6);
+            long idExistente = rdOp.GetInt64(0);
+            bool mismo = rdOp.GetInt32(1) == c.SucursalId
+                && rdOp.GetInt32(2) == (c.MesaId ?? 0)
+                && Math.Abs(rdOp.GetDecimal(3) - c.TotalMesa) < 0.01m
+                && Math.Abs(rdOp.GetDecimal(4) - c.TotalConsumo) < 0.01m
+                && Math.Abs(rdOp.GetDecimal(5) - c.TotalCobrado) < 0.01m
+                && string.Equals(rdOp.GetString(6), c.MetodoPago ?? "", StringComparison.OrdinalIgnoreCase);
+            string oldSync = rdOp.IsDBNull(7) ? "" : rdOp.GetString(7);
             if (!mismo)
-                return Results.Conflict(new { ok = false, message = "Esta sesión ya fue cobrada con datos distintos. Se bloqueó para evitar doble cobro o alteración.", sessionId = c.SessionId, id = idExistente });
-            return Results.Ok(new { ok = true, syncKey = oldSync, id = idExistente, idempotent = true, sameSession = true });
+                return Results.Conflict(new { ok = false, message = "La misma operación física ya fue cobrada con datos distintos. Se bloqueó para evitar doble cobro.", operationKey, id = idExistente });
+            return Results.Ok(new { ok = true, syncKey = oldSync, operationKey, id = idExistente, idempotent = true, sameOperation = true });
         }
     }
 
@@ -3008,12 +2986,10 @@ app.MapPost("/api/cobros-mesa", async (Db db, SheetsReporter sheets, CobroMesaRe
         return Results.BadRequest(new { ok = false, message = "El total cobrado no coincide con mesa + consumo. Se bloqueó para evitar descuadre.", esperado = esperadoCobro, recibido = c.TotalCobrado });
 
     const string sql = """
-        INSERT INTO cobros_mesa
-        (sucursal_id, session_id, mesa_id, mesa, caja_nombre, sector, cajero, mesera, fecha, tiempo, total_mesa, total_consumo, total_cobrado, metodo_pago, sync_key)
+        INSERT IGNORE INTO cobros_mesa
+        (sucursal_id, session_id, mesa_id, mesa, caja_nombre, sector, cajero, mesera, fecha, tiempo, total_mesa, total_consumo, total_cobrado, metodo_pago, sync_key, operation_key)
         VALUES
-        (@sucursal_id, @session_id, @mesa_id, @mesa, @caja_nombre, @sector, @cajero, @mesera, @fecha, @tiempo, @total_mesa, @total_consumo, @total_cobrado, @metodo_pago, @sync_key)
-        ON DUPLICATE KEY UPDATE
-            sync_key = VALUES(sync_key);
+        (@sucursal_id, @session_id, @mesa_id, @mesa, @caja_nombre, @sector, @cajero, @mesera, @fecha, @tiempo, @total_mesa, @total_consumo, @total_cobrado, @metodo_pago, @sync_key, NULLIF(@operation_key,''));
     """;
 
     await using var cmd = new MySqlCommand(sql, con);
@@ -3032,6 +3008,7 @@ app.MapPost("/api/cobros-mesa", async (Db db, SheetsReporter sheets, CobroMesaRe
     cmd.Parameters.AddWithValue("@total_cobrado", c.TotalCobrado);
     cmd.Parameters.AddWithValue("@metodo_pago", c.MetodoPago ?? "");
     cmd.Parameters.AddWithValue("@sync_key", syncKey);
+    cmd.Parameters.AddWithValue("@operation_key", operationKey);
 
     await cmd.ExecuteNonQueryAsync();
 
@@ -3063,12 +3040,18 @@ app.MapGet("/api/cobros-mesa", async (Db db, int? sucursalId) =>
             total_cobrado DECIMAL(10,2) NOT NULL DEFAULT 0,
             metodo_pago VARCHAR(50) NOT NULL,
             sync_key VARCHAR(180) NOT NULL UNIQUE,
-            UNIQUE KEY uk_cobro_sesion_sector (sucursal_id, sector, session_id)
+            operation_key VARCHAR(220) NULL,
+            UNIQUE KEY uk_cobro_operation_key (operation_key)
         );
     """, con))
     {
         await create.ExecuteNonQueryAsync();
     }
+
+    // V90: compatibilidad con bases existentes.
+    try { await new MySqlCommand("ALTER TABLE cobros_mesa ADD COLUMN operation_key VARCHAR(220) NULL AFTER sync_key;", con).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE cobros_mesa DROP INDEX uk_cobro_sesion_sector;", con).ExecuteNonQueryAsync(); } catch { }
+    try { await new MySqlCommand("ALTER TABLE cobros_mesa ADD UNIQUE KEY uk_cobro_operation_key (operation_key);", con).ExecuteNonQueryAsync(); } catch { }
 
     try
     {
@@ -5116,12 +5099,7 @@ static async Task<(bool ok, string message)> AcquireSaleGuardsAsync(MySqlConnect
     var lockNames = new SortedSet<string>(StringComparer.Ordinal);
     lockNames.Add("SALEOP_" + HashKey(operationKey));
 
-    string tipo = (venta.Tipo ?? "").Trim().ToUpperInvariant();
-    if (tipo == "MESA" && venta.SessionId.HasValue && venta.SessionId.Value > 0)
-        lockNames.Add("MESAFINAL_" + HashKey(
-            venta.SucursalId.ToString(System.Globalization.CultureInfo.InvariantCulture) + "|" +
-            (venta.CajaNombre ?? "").Trim().ToUpperInvariant() + "|" +
-            venta.SessionId.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+    // V90: no se bloquea por SessionId; OperationKey es la identidad global del cobro final.
 
     if (venta.Detalle != null)
     {
@@ -8073,7 +8051,8 @@ public record CobroMesaRequest(
     decimal TotalConsumo,
     decimal TotalCobrado,
     string? MetodoPago,
-    string? SyncKey
+    string? SyncKey,
+    string? OperationKey = null
 );
 
 public record ReservaRequest(
